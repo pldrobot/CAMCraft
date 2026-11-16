@@ -2,18 +2,21 @@ use serde::{Deserialize, Serialize};
 
 pub type Pt = [f64; 2];
 
-/// Per-job values. A flavor carries defaults, each project keeps its own copy.
+/// Per-job values. A machine carries defaults, each project keeps its own copy.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct JobSettings {
     pub dispense_feed: f64,
     pub travel_feed: f64,
     pub use_z: bool,
     pub safe_z: f64,
     pub dispense_z: f64,
-    /// Wait after valve on, before moving (glue pressure build-up).
-    pub pre_flow_ms: u32,
-    /// Wait after valve off, before lifting (pressure release).
-    pub post_flow_ms: u32,
+    /// Wait after the end effector is switched on, before moving.
+    #[serde(alias = "pre_flow_ms")]
+    pub on_delay_ms: u32,
+    /// Wait after the end effector is switched off, before lifting.
+    #[serde(alias = "post_flow_ms")]
+    pub off_delay_ms: u32,
 }
 
 impl Default for JobSettings {
@@ -24,22 +27,16 @@ impl Default for JobSettings {
             use_z: true,
             safe_z: 10.0,
             dispense_z: 2.0,
-            pre_flow_ms: 200,
-            post_flow_ms: 100,
+            on_delay_ms: 200,
+            off_delay_ms: 100,
         }
     }
 }
 
-/// A G-code dialect. Everything is plain text so it can be edited in the UI.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Flavor {
-    pub name: String,
-    /// Lines written at the start (units, absolute mode, homing...).
-    pub header: String,
-    /// Lines written at the end.
-    pub footer: String,
-    pub valve_on: String,
-    pub valve_off: String,
+/// How G-code is written. Plain text so it can be edited in the UI.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GcodeStyle {
     /// Dwell template. `{s}` is seconds, `{ms}` is milliseconds.
     pub dwell: String,
     pub rapid_cmd: String,
@@ -49,31 +46,14 @@ pub struct Flavor {
     pub decimals: usize,
     pub comments: bool,
     /// Write G2/G3 for arcs instead of many short G1 lines.
-    #[serde(default)]
     pub arcs: bool,
-    #[serde(default = "default_cw")]
     pub cw_cmd: String,
-    #[serde(default = "default_ccw")]
     pub ccw_cmd: String,
-    pub defaults: JobSettings,
 }
 
-fn default_cw() -> String {
-    "G2".into()
-}
-
-fn default_ccw() -> String {
-    "G3".into()
-}
-
-impl Flavor {
-    pub fn grbl() -> Self {
+impl Default for GcodeStyle {
+    fn default() -> Self {
         Self {
-            name: "GRBL".into(),
-            header: "G21\nG90\nG94".into(),
-            footer: "M30".into(),
-            valve_on: "M8".into(),
-            valve_off: "M9".into(),
             dwell: "G4 P{s}".into(),
             rapid_cmd: "G0".into(),
             linear_cmd: "G1".into(),
@@ -81,62 +61,316 @@ impl Flavor {
             decimals: 3,
             comments: true,
             arcs: false,
-            cw_cmd: default_cw(),
-            ccw_cmd: default_ccw(),
-            defaults: JobSettings::default(),
+            cw_cmd: "G2".into(),
+            ccw_cmd: "G3".into(),
+        }
+    }
+}
+
+fn default_pre_script() -> String {
+    "G21\nG90\nG94".into()
+}
+
+fn default_post_script() -> String {
+    "M30".into()
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EffectorKind {
+    Motor,
+    Laser,
+    #[default]
+    Glue,
+    /// Only used for the simulation drawing.
+    Other,
+}
+
+impl EffectorKind {
+    pub const ALL: [EffectorKind; 4] =
+        [EffectorKind::Motor, EffectorKind::Laser, EffectorKind::Glue, EffectorKind::Other];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EffectorKind::Motor => "Motor",
+            EffectorKind::Laser => "Laser",
+            EffectorKind::Glue => "Glue",
+            EffectorKind::Other => "Other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ControlType {
+    /// Two commands: on and off.
+    #[default]
+    Binary,
+    /// One command template with a value; off is the minimum, on is the maximum.
+    Pwm,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EndEffector {
+    pub kind: EffectorKind,
+    pub control: ControlType,
+    pub on_cmd: String,
+    pub off_cmd: String,
+    /// PWM command template. `{v}` is replaced by the value.
+    pub pwm_cmd: String,
+    /// Value written for "off".
+    pub pwm_min: f64,
+    /// Value written for "on".
+    pub pwm_max: f64,
+}
+
+impl Default for EndEffector {
+    fn default() -> Self {
+        Self {
+            kind: EffectorKind::Glue,
+            control: ControlType::Binary,
+            on_cmd: "M8".into(),
+            off_cmd: "M9".into(),
+            pwm_cmd: "M3 S{v}".into(),
+            pwm_min: 0.0,
+            pwm_max: 1000.0,
+        }
+    }
+}
+
+impl EndEffector {
+    pub fn on_line(&self) -> String {
+        match self.control {
+            ControlType::Binary => self.on_cmd.clone(),
+            ControlType::Pwm => self.pwm_line(self.pwm_max),
         }
     }
 
-    pub fn marlin() -> Self {
-        Self {
-            name: "Marlin".into(),
-            header: "G21\nG90\nG92 E0".into(),
-            footer: "M84".into(),
-            valve_on: "M106 S255".into(),
-            valve_off: "M107".into(),
-            dwell: "G4 P{ms}".into(),
-            rapid_cmd: "G0".into(),
-            linear_cmd: "G1".into(),
-            rapid_with_feed: true,
-            decimals: 3,
-            comments: true,
-            arcs: false,
-            cw_cmd: default_cw(),
-            ccw_cmd: default_ccw(),
-            defaults: JobSettings::default(),
+    pub fn off_line(&self) -> String {
+        match self.control {
+            ControlType::Binary => self.off_cmd.clone(),
+            ControlType::Pwm => self.pwm_line(self.pwm_min),
         }
     }
+
+    fn pwm_line(&self, v: f64) -> String {
+        let mut t = format!("{:.3}", v);
+        while t.ends_with('0') {
+            t.pop();
+        }
+        if t.ends_with('.') {
+            t.pop();
+        }
+        self.pwm_cmd.replace("{v}", &t)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AxisOwner {
+    /// The axis moves the end effector.
+    #[default]
+    EndEffector,
+    /// The axis moves the bed.
+    Bed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Machine {
     pub name: String,
-    pub size_x: f64,
-    pub size_y: f64,
-    pub size_z: f64,
-    pub flavor: String,
+    /// Usable bed size. Old files call these size_x/y/z.
+    #[serde(alias = "size_x")]
+    pub bed_x: f64,
+    #[serde(alias = "size_y")]
+    pub bed_y: f64,
+    #[serde(alias = "size_z")]
+    pub bed_z: f64,
+    /// Travel of each axis. 0 means "same as the bed" (old files).
+    #[serde(default)]
+    pub travel_x: f64,
+    #[serde(default)]
+    pub travel_y: f64,
+    #[serde(default)]
+    pub travel_z: f64,
+    /// Which part each axis (X, Y, Z) moves: the end effector or the bed.
+    #[serde(default)]
+    pub axes: [AxisOwner; 3],
+    #[serde(default)]
+    pub effector: EndEffector,
+    /// Fixed bed position (see `bed_position`). Negative = automatic.
+    #[serde(default = "auto3")]
+    pub bed_pos: [f64; 3],
+    /// Fixed end effector position (see `effector_position`). Negative = automatic.
+    #[serde(default = "auto3")]
+    pub effector_pos: [f64; 3],
+    /// Homing position of the end effector in G-code coordinates. `None` is
+    /// automatic: work zero on X and Y, the top of the travel on Z.
+    #[serde(default)]
+    pub home: [Option<f64>; 3],
+    /// Lines written at the start of the G-code (units, absolute mode, homing...).
+    #[serde(default = "default_pre_script")]
+    pub pre_script: String,
+    /// Lines written at the end of the G-code.
+    #[serde(default = "default_post_script")]
+    pub post_script: String,
+    #[serde(default)]
+    pub gcode: GcodeStyle,
+    /// Speeds and other defaults for new projects.
+    #[serde(default)]
+    pub job: JobSettings,
+}
+
+fn auto3() -> [f64; 3] {
+    [-1.0; 3]
+}
+
+impl Machine {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            bed_x: 150.0,
+            bed_y: 100.0,
+            bed_z: 20.0,
+            travel_x: 150.0,
+            travel_y: 100.0,
+            travel_z: 50.0,
+            axes: [AxisOwner::EndEffector; 3],
+            effector: EndEffector::default(),
+            bed_pos: auto3(),
+            effector_pos: auto3(),
+            home: [None; 3],
+            pre_script: default_pre_script(),
+            post_script: default_post_script(),
+            gcode: GcodeStyle::default(),
+            job: JobSettings::default(),
+        }
+    }
+
+    pub fn bed(&self) -> [f64; 3] {
+        [self.bed_x, self.bed_y, self.bed_z]
+    }
+
+    /// Axis travel, falling back to the bed size when not set.
+    pub fn travel(&self) -> [f64; 3] {
+        let t = [self.travel_x, self.travel_y, self.travel_z];
+        let b = self.bed();
+        [0, 1, 2].map(|i| if t[i] > 0.0 { t[i] } else { b[i] })
+    }
+
+    /// Where the end effector sits after homing, in G-code coordinates.
+    pub fn home_position(&self) -> [f64; 3] {
+        let t = self.travel();
+        [self.home[0].unwrap_or(0.0), self.home[1].unwrap_or(0.0), self.home[2].unwrap_or(t[2])]
+    }
+
+    /// Size of the machine box. An axis that moves the bed needs the bed plus
+    /// the travel; an axis that moves the end effector needs only the travel.
+    pub fn frame_size(&self) -> [f64; 3] {
+        let (t, b) = (self.travel(), self.bed());
+        [0, 1, 2].map(|i| match self.axes[i] {
+            AxisOwner::Bed => b[i] + t[i],
+            AxisOwner::EndEffector => t[i],
+        })
+    }
+
+    /// Valid range for the end effector position of a bed axis.
+    pub fn effector_range(&self, i: usize) -> (f64, f64) {
+        let (t, b) = (self.travel(), self.bed());
+        (0.0, b[i] + t[i])
+    }
+
+    /// Valid range for the bed position of an end effector axis.
+    pub fn bed_range(&self, i: usize) -> (f64, f64) {
+        (0.0, self.travel()[i])
+    }
+
+    /// Fixed bed position, measured from the machine box corner. Only an axis
+    /// that moves the end effector has one (a bed axis sweeps the bed instead,
+    /// so 0 is returned). Z: the bed top sits at the bed thickness.
+    pub fn bed_position(&self) -> [f64; 3] {
+        let b = self.bed();
+        [0, 1, 2].map(|i| match (self.axes[i], i) {
+            (AxisOwner::Bed, _) => 0.0,
+            (AxisOwner::EndEffector, 2) => b[2],
+            (AxisOwner::EndEffector, _) => {
+                let (lo, hi) = self.bed_range(i);
+                let v = if self.bed_pos[i] >= 0.0 { self.bed_pos[i] } else { 0.0 };
+                v.clamp(lo, hi)
+            }
+        })
+    }
+
+    /// Fixed end effector position, measured from the machine box corner. Only
+    /// an axis that moves the bed has one (an end effector axis sweeps the tool
+    /// from 0, so 0 is returned). Z: the tool is at the top of the box.
+    pub fn effector_position(&self) -> [f64; 3] {
+        let (t, b) = (self.travel(), self.bed());
+        [0, 1, 2].map(|i| match (self.axes[i], i) {
+            (AxisOwner::EndEffector, _) => 0.0,
+            (AxisOwner::Bed, 2) => b[2] + t[2],
+            (AxisOwner::Bed, _) => {
+                let (lo, hi) = self.effector_range(i);
+                let v = if self.effector_pos[i] >= 0.0 { self.effector_pos[i] } else { t[i] };
+                v.clamp(lo, hi)
+            }
+        })
+    }
+
+    /// The part of the bed the end effector can reach, as (low, high) in bed
+    /// coordinates (0 at the bed corner). Z is height above the bed top.
+    /// Never larger than the bed or the travel.
+    /// - Bed axis: the tool is fixed at e and the bed corner sweeps 0..travel,
+    ///   so the tool reaches bed points e - travel .. e.
+    /// - End effector axis: the tool sweeps 0..travel over a bed at bp, so it
+    ///   reaches bed points -bp .. travel - bp.
+    pub fn workable_on_bed(&self) -> [(f64, f64); 3] {
+        let (t, b) = (self.travel(), self.bed());
+        let (bp, ep) = (self.bed_position(), self.effector_position());
+        [0, 1, 2].map(|i| {
+            if i == 2 {
+                return (0.0, t[2]);
+            }
+            match self.axes[i] {
+                AxisOwner::Bed => ((ep[i] - t[i]).max(0.0), b[i].min(ep[i])),
+                AxisOwner::EndEffector => ((-bp[i]).max(0.0), b[i].min(t[i] - bp[i])),
+            }
+        })
+    }
+
+    /// Workable range in G-code coordinates. Work zero is the lowest point the
+    /// end effector can reach on the bed, so every range starts at 0.
+    pub fn workable(&self) -> [(f64, f64); 3] {
+        self.workable_on_bed().map(|(lo, hi)| (0.0, hi - lo))
+    }
+
+    /// The bed rectangle in G-code X/Y coordinates.
+    pub fn bed_in_gcode(&self) -> [(f64, f64); 2] {
+        let (w, b) = (self.workable_on_bed(), self.bed());
+        [0, 1].map(|i| (-w[i].0, b[i] - w[i].0))
+    }
+
+    /// G-code X/Y/Z to bed coordinates.
+    pub fn gcode_to_bed(&self, g: [f64; 3]) -> [f64; 3] {
+        let w = self.workable_on_bed();
+        [g[0] + w[0].0, g[1] + w[1].0, g[2]]
+    }
+
+    pub fn in_workable(&self, p: Pt) -> bool {
+        let w = self.workable();
+        let e = 1e-6;
+        p[0] >= w[0].0 - e && p[0] <= w[0].1 + e && p[1] >= w[1].0 - e && p[1] <= w[1].1 + e
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Library {
     pub machines: Vec<Machine>,
-    pub flavors: Vec<Flavor>,
 }
 
 impl Default for Library {
     fn default() -> Self {
-        Self {
-            machines: vec![],
-            flavors: vec![Flavor::grbl(), Flavor::marlin()],
-        }
+        Self { machines: vec![] }
     }
 }
 
 impl Library {
-    pub fn flavor(&self, name: &str) -> Option<&Flavor> {
-        self.flavors.iter().find(|f| f.name == name)
-    }
-
     fn path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|d| d.join("CAMCraft").join("library.json"))
     }
@@ -145,14 +379,10 @@ impl Library {
         let Some(p) = Self::path() else {
             return Self::default();
         };
-        let mut lib: Library = std::fs::read_to_string(p)
+        std::fs::read_to_string(p)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if lib.flavors.is_empty() {
-            lib.flavors = Library::default().flavors;
-        }
-        lib
+            .unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -231,17 +461,15 @@ pub struct SeqItem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub machine: Machine,
-    pub flavor: String,
     pub job: JobSettings,
     pub parts: Vec<Part>,
     pub sequence: Vec<SeqItem>,
 }
 
 impl Project {
-    pub fn new(machine: Machine, flavor: &Flavor) -> Self {
+    pub fn new(machine: Machine) -> Self {
         Self {
-            flavor: flavor.name.clone(),
-            job: flavor.defaults.clone(),
+            job: machine.job.clone(),
             machine,
             parts: vec![],
             sequence: vec![],

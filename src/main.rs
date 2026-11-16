@@ -2,12 +2,14 @@ mod canvas;
 mod dxf_import;
 mod gcode;
 mod model;
+mod preview;
 mod theme;
 
 use canvas::{Canvas, Tool};
 use eframe::egui;
 use egui::{Color32, RichText};
 use model::*;
+use preview::Preview;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -15,7 +17,21 @@ use std::path::PathBuf;
 enum Screen {
     Project,
     Machines,
-    Flavors,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum MachineTab {
+    Machine,
+    Speed,
+    EndEffector,
+    Scripts,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ProjectTab {
+    Prepare,
+    PathSelection,
+    Preview,
 }
 
 enum Action {
@@ -48,8 +64,11 @@ struct App {
     log: Vec<String>,
     show_new: bool,
     new_machine_idx: usize,
-    flavor_sel: usize,
-    machine_draft: Machine,
+    machine_tab: MachineTab,
+    rename: Option<String>,
+    machine_sel: usize,
+    tab: ProjectTab,
+    preview: Preview,
     pending_dxf: Option<PendingDxf>,
 }
 
@@ -57,7 +76,6 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let lib = Library::load();
-        let flavor = lib.flavors.first().map(|f| f.name.clone()).unwrap_or_default();
         Self {
             lib,
             lib_dirty: false,
@@ -71,15 +89,12 @@ impl App {
             log: vec!["CAMCraft ready. Command: New Project".into()],
             show_new: false,
             new_machine_idx: 0,
-            flavor_sel: 0,
+            machine_tab: MachineTab::Machine,
+            rename: None,
+            machine_sel: 0,
+            tab: ProjectTab::Prepare,
+            preview: Preview::default(),
             pending_dxf: None,
-            machine_draft: Machine {
-                name: "New machine".into(),
-                size_x: 150.0,
-                size_y: 100.0,
-                size_z: 20.0,
-                flavor,
-            },
         }
     }
 
@@ -114,6 +129,8 @@ impl App {
                         self.canvas = Canvas::default();
                         self.gcode.clear();
                         self.warnings.clear();
+                        self.preview.clear();
+                        self.tab = ProjectTab::Prepare;
                         self.screen = Screen::Project;
                         self.say(format!("Opened {}", path.display()));
                     }
@@ -169,13 +186,17 @@ impl App {
                 }
             }
             Action::Generate => {
+                // The project holds a copy of its machine. Take the current
+                // settings from the library so edits are not missed.
+                if let Some(project) = &mut self.project {
+                    if let Some(m) = self.lib.machines.iter().find(|m| m.name == project.machine.name) {
+                        project.machine = m.clone();
+                    }
+                }
                 let Some(project) = &self.project else { return };
-                let Some(flavor) = self.lib.flavor(&project.flavor).cloned() else {
-                    self.say(format!("Flavor '{}' not found in flavor management.", project.flavor));
-                    return;
-                };
-                let r = gcode::generate(project, &flavor);
+                let r = gcode::generate(project);
                 let lines = r.text.lines().count();
+                self.preview.set_moves(r.moves, &project.job);
                 self.gcode = r.text;
                 self.warnings = r.warnings;
                 self.gcode_open = true;
@@ -219,10 +240,14 @@ impl App {
         project.parts.push(Part {
             name: name.clone(),
             paths: r.paths,
-            // Put the lower-left corner of the drawing 5 mm inside the bed.
-            offset: [5.0 - minx, 5.0 - miny],
+            // Put the lower-left corner of the drawing 5 mm inside the workable area.
+            offset: [
+                project.machine.workable()[0].0 + 5.0 - minx,
+                project.machine.workable()[1].0 + 5.0 - miny,
+            ],
         });
-        let big = w > project.machine.size_x || h > project.machine.size_y;
+        let wk = project.machine.workable();
+        let big = w > wk[0].1 - wk[0].0 || h > wk[1].1 - wk[1].0;
         self.canvas.selected_part = Some(project.parts.len() - 1);
         self.canvas.tool = Tool::Move;
         self.say(format!("Inserted {name}: {n} paths, {:.1} x {:.1} mm (assumed mm)", w, h));
@@ -230,7 +255,7 @@ impl App {
             self.say(s);
         }
         if big {
-            self.say("Warning: drawing is larger than the bed.");
+            self.say("Warning: drawing is larger than the workable area.");
         }
     }
 
@@ -315,7 +340,6 @@ impl App {
                 ui.separator();
                 ui.selectable_value(&mut self.screen, Screen::Project, "Project");
                 ui.selectable_value(&mut self.screen, Screen::Machines, "Machines");
-                ui.selectable_value(&mut self.screen, Screen::Flavors, "Flavors");
             });
         });
     }
@@ -362,7 +386,7 @@ impl App {
                                 ui.selectable_value(
                                     &mut self.new_machine_idx,
                                     i,
-                                    format!("{}  ({} x {} x {} mm, {})", m.name, m.size_x, m.size_y, m.size_z, m.flavor),
+                                    format!("{}  (bed {} x {} x {} mm)", m.name, m.bed_x, m.bed_y, m.bed_z),
                                 );
                             }
                         });
@@ -378,22 +402,16 @@ impl App {
         }
         if create {
             let m = self.lib.machines[self.new_machine_idx].clone();
-            let flavor = self
-                .lib
-                .flavor(&m.flavor)
-                .or_else(|| self.lib.flavors.first())
-                .cloned()
-                .unwrap_or_else(Flavor::grbl);
-            let mut p = Project::new(m.clone(), &flavor);
-            p.flavor = flavor.name.clone();
-            self.project = Some(p);
+            self.project = Some(Project::new(m.clone()));
             self.project_path = None;
             self.canvas = Canvas::default();
             self.gcode.clear();
             self.warnings.clear();
+            self.preview.clear();
+            self.tab = ProjectTab::Prepare;
             self.screen = Screen::Project;
             self.show_new = false;
-            self.say(format!("New project on {} ({} x {} mm)", m.name, m.size_x, m.size_y));
+            self.say(format!("New project on {} ({} x {} mm)", m.name, m.bed_x, m.bed_y));
         }
         if !open {
             self.show_new = false;
@@ -406,7 +424,7 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.35);
                     ui.heading("CAMCraft");
-                    ui.label("Glue path programming for dispensing machines");
+                    ui.label("Path programming for CNC machines");
                     ui.add_space(12.0);
                     if ui.button("New Project...").clicked() {
                         actions.push(Action::NewProject);
@@ -419,163 +437,254 @@ impl App {
             return;
         }
 
-        let Self { lib, project, canvas, gcode, gcode_open, warnings, .. } = self;
+        let Self { lib, project, canvas, gcode, gcode_open, warnings, tab, preview, .. } = self;
         let project = project.as_mut().unwrap();
+        let generated = preview.has_path();
+        if *tab == ProjectTab::Preview && !generated {
+            *tab = ProjectTab::Prepare;
+        }
+
+        egui::Panel::top("project_tabs").show(root, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(tab, ProjectTab::Prepare, "Prepare");
+                ui.selectable_value(tab, ProjectTab::PathSelection, "Path selection");
+                ui.add_enabled_ui(generated, |ui| {
+                    ui.selectable_value(tab, ProjectTab::Preview, "Preview")
+                        .on_disabled_hover_text("Generate G-code first.");
+                });
+            });
+        });
+
+        match *tab {
+            ProjectTab::Prepare => canvas.tool = Tool::Move,
+            ProjectTab::PathSelection => canvas.tool = Tool::Sequence,
+            ProjectTab::Preview => {}
+        }
 
         egui::Panel::left("left").default_size(310.0).show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Machine");
-                ui.label(format!(
-                    "{}   {} x {} x {} mm",
-                    project.machine.name, project.machine.size_x, project.machine.size_y, project.machine.size_z
-                ));
-                ui.horizontal(|ui| {
-                    ui.label("Flavor");
-                    egui::ComboBox::from_id_salt("proj_flavor")
-                        .selected_text(project.flavor.clone())
-                        .show_ui(ui, |ui| {
-                            for f in &lib.flavors {
-                                ui.selectable_value(&mut project.flavor, f.name.clone(), &f.name);
-                            }
-                        });
-                });
-                ui.separator();
-
-                ui.heading("Parts");
-                if ui.button("Insert DXF...").clicked() {
-                    actions.push(Action::InsertDxf);
-                }
-                let mut remove: Option<usize> = None;
-                for pi in 0..project.parts.len() {
-                    let selected = canvas.selected_part == Some(pi);
-                    ui.horizontal(|ui| {
-                        let name = format!("{}  ({} paths)", project.parts[pi].name, project.parts[pi].paths.len());
-                        if ui.selectable_label(selected, name).clicked() {
-                            canvas.selected_part = Some(pi);
-                        }
-                        if ui.small_button("x").on_hover_text("Remove part").clicked() {
-                            remove = Some(pi);
-                        }
-                    });
-                    if selected {
-                        let part = &mut project.parts[pi];
-                        // Show the lower-left corner of the drawing on the bed, not the
-                        // DXF origin, which can be far from the geometry.
-                        let mut c = part.min_corner();
-                        let before = c;
-                        ui.horizontal(|ui| {
-                            ui.label("   X");
-                            ui.add(egui::DragValue::new(&mut c[0]).speed(0.1).suffix(" mm"));
-                            ui.label("Y");
-                            ui.add(egui::DragValue::new(&mut c[1]).speed(0.1).suffix(" mm"));
-                        });
-                        part.offset[0] += c[0] - before[0];
-                        part.offset[1] += c[1] - before[1];
-                    }
-                }
-                if let Some(i) = remove {
-                    project.remove_part(i);
-                    canvas.selected_part = None;
-                }
-                ui.separator();
-
-                ui.heading("Sequence");
-                ui.horizontal(|ui| {
-                    if ui.button("Add all").clicked() {
-                        for (pi, part) in project.parts.iter().enumerate() {
-                            for ci in 0..part.paths.len() {
-                                if project.seq_index(pi, ci).is_none() {
-                                    project.sequence.push(SeqItem { part: pi, path: ci, reverse: false });
+                match *tab {
+                    ProjectTab::Prepare => {
+                        let m = &project.machine;
+                        ui.heading("Machine");
+                        ui.label(format!(
+                            "{}   bed {} x {} x {} mm",
+                            m.name, m.bed_x, m.bed_y, m.bed_z
+                        ));
+                        let t = m.travel();
+                        ui.label(
+                            RichText::new(format!(
+                                "Travel {} x {} x {} mm   Tool: {} ({})",
+                                t[0],
+                                t[1],
+                                t[2],
+                                m.effector.kind.label(),
+                                match m.effector.control {
+                                    ControlType::Binary => "binary",
+                                    ControlType::Pwm => "PWM",
                                 }
-                            }
-                        }
-                    }
-                    if ui.button("Clear").clicked() {
-                        project.sequence.clear();
-                    }
-                });
-                ui.label(
-                    RichText::new("Use the Sequence tool and click paths on the bed. Click again to remove.")
-                        .small()
-                        .weak(),
-                );
-                let mut del: Option<usize> = None;
-                let mut up: Option<usize> = None;
-                let mut down: Option<usize> = None;
-                let n = project.sequence.len();
-                for i in 0..n {
-                    let item = project.sequence[i];
-                    ui.horizontal(|ui| {
-                        let pname = project.parts.get(item.part).map(|p| p.name.clone()).unwrap_or_default();
-                        ui.label(format!("{:>2}. {} #{}", i + 1, pname, item.path + 1));
-                        if ui.small_button("^").clicked() && i > 0 {
-                            up = Some(i);
-                        }
-                        if ui.small_button("v").clicked() && i + 1 < n {
-                            down = Some(i);
-                        }
+                            ))
+                            .small()
+                            .weak(),
+                        );
                         if ui
-                            .selectable_label(item.reverse, "rev")
-                            .on_hover_text("Reverse direction")
+                            .button("Reload machine settings")
+                            .on_hover_text("The project keeps a copy of the machine and its speeds. Use this after editing the machine in Machines.")
                             .clicked()
                         {
-                            project.sequence[i].reverse = !item.reverse;
+                            if let Some(m) = lib.machines.iter().find(|m| m.name == project.machine.name) {
+                                project.job = m.job.clone();
+                                project.machine = m.clone();
+                            }
                         }
-                        if ui.small_button("x").clicked() {
-                            del = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = up {
-                    project.sequence.swap(i, i - 1);
-                }
-                if let Some(i) = down {
-                    project.sequence.swap(i, i + 1);
-                }
-                if let Some(i) = del {
-                    project.sequence.remove(i);
-                }
-                ui.separator();
+                        ui.separator();
 
-                ui.heading("Job settings");
-                let j = &mut project.job;
-                egui::Grid::new("job").num_columns(2).show(ui, |ui| {
-                    ui.label("Dispense feed");
-                    ui.add(egui::DragValue::new(&mut j.dispense_feed).speed(5.0).range(1.0..=20000.0).suffix(" mm/min"));
-                    ui.end_row();
-                    ui.label("Travel feed");
-                    ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"));
-                    ui.end_row();
-                    ui.label("Use Z axis");
-                    ui.checkbox(&mut j.use_z, "");
-                    ui.end_row();
-                    ui.add_enabled_ui(j.use_z, |ui| ui.label("Safe Z"));
-                    ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm"));
-                    ui.end_row();
-                    ui.add_enabled_ui(j.use_z, |ui| ui.label("Dispense Z"));
-                    ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm"));
-                    ui.end_row();
-                    ui.label("Pre-flow wait");
-                    ui.add(egui::DragValue::new(&mut j.pre_flow_ms).speed(5.0).suffix(" ms"));
-                    ui.end_row();
-                    ui.label("Post-flow wait");
-                    ui.add(egui::DragValue::new(&mut j.post_flow_ms).speed(5.0).suffix(" ms"));
-                    ui.end_row();
-                });
-                ui.add_space(8.0);
-                if ui
-                    .add_sized([ui.available_width(), 30.0], egui::Button::new(RichText::new("Generate G-code").strong()).fill(theme::ACCENT))
-                    .clicked()
-                {
-                    actions.push(Action::Generate);
-                }
-                for w in warnings.iter() {
-                    ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
+                        ui.heading("Parts");
+                        if ui.button("Insert DXF...").clicked() {
+                            actions.push(Action::InsertDxf);
+                        }
+                        let mut remove: Option<usize> = None;
+                        for pi in 0..project.parts.len() {
+                            let selected = canvas.selected_part == Some(pi);
+                            ui.horizontal(|ui| {
+                                let name = format!(
+                                    "{}  ({} paths)",
+                                    project.parts[pi].name,
+                                    project.parts[pi].paths.len()
+                                );
+                                if ui.selectable_label(selected, name).clicked() {
+                                    canvas.selected_part = Some(pi);
+                                }
+                                if ui.small_button("x").on_hover_text("Remove part").clicked() {
+                                    remove = Some(pi);
+                                }
+                            });
+                            if selected {
+                                let part = &mut project.parts[pi];
+                                // Show the lower-left corner of the drawing on the bed, not the
+                                // DXF origin, which can be far from the geometry.
+                                let mut c = part.min_corner();
+                                let before = c;
+                                ui.horizontal(|ui| {
+                                    ui.label("   X");
+                                    ui.add(egui::DragValue::new(&mut c[0]).speed(0.1).suffix(" mm"));
+                                    ui.label("Y");
+                                    ui.add(egui::DragValue::new(&mut c[1]).speed(0.1).suffix(" mm"));
+                                });
+                                part.offset[0] += c[0] - before[0];
+                                part.offset[1] += c[1] - before[1];
+                            }
+                        }
+                        if let Some(i) = remove {
+                            project.remove_part(i);
+                            canvas.selected_part = None;
+                        }
+                        ui.separator();
+
+                        ui.heading("Job settings");
+                        let j = &mut project.job;
+                        egui::Grid::new("job").num_columns(2).show(ui, |ui| {
+                            ui.label("Work feed");
+                            ui.add(egui::DragValue::new(&mut j.dispense_feed).speed(5.0).range(1.0..=20000.0).suffix(" mm/min"));
+                            ui.end_row();
+                            ui.label("Travel feed");
+                            ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"));
+                            ui.end_row();
+                            ui.label("Use Z axis");
+                            ui.checkbox(&mut j.use_z, "");
+                            ui.end_row();
+                            ui.add_enabled_ui(j.use_z, |ui| ui.label("Safe Z"));
+                            ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm"));
+                            ui.end_row();
+                            ui.add_enabled_ui(j.use_z, |ui| ui.label("Work Z"));
+                            ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm"));
+                            ui.end_row();
+                            ui.label("Start delay");
+                            ui.add(egui::DragValue::new(&mut j.on_delay_ms).speed(5.0).suffix(" ms"));
+                            ui.end_row();
+                            ui.label("Stop delay");
+                            ui.add(egui::DragValue::new(&mut j.off_delay_ms).speed(5.0).suffix(" ms"));
+                            ui.end_row();
+                        });
+                        ui.add_space(8.0);
+                        if ui
+                            .add_sized([ui.available_width(), 30.0], egui::Button::new(RichText::new("Generate G-code").strong()).fill(theme::ACCENT))
+                            .clicked()
+                        {
+                            actions.push(Action::Generate);
+                        }
+                        for w in warnings.iter() {
+                            ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
+                        }
+                    }
+                    ProjectTab::PathSelection => {
+                        ui.heading("Sequence");
+                        ui.horizontal(|ui| {
+                            if ui.button("Add all").clicked() {
+                                for (pi, part) in project.parts.iter().enumerate() {
+                                    for ci in 0..part.paths.len() {
+                                        if project.seq_index(pi, ci).is_none() {
+                                            project.sequence.push(SeqItem { part: pi, path: ci, reverse: false });
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.button("Clear").clicked() {
+                                project.sequence.clear();
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Click paths on the bed to add them in order. Click again to remove.")
+                                .small()
+                                .weak(),
+                        );
+                        let mut del: Option<usize> = None;
+                        let mut up: Option<usize> = None;
+                        let mut down: Option<usize> = None;
+                        let n = project.sequence.len();
+                        for i in 0..n {
+                            let item = project.sequence[i];
+                            ui.horizontal(|ui| {
+                                let pname = project.parts.get(item.part).map(|p| p.name.clone()).unwrap_or_default();
+                                ui.label(format!("{:>2}. {} #{}", i + 1, pname, item.path + 1));
+                                if ui.small_button("^").clicked() && i > 0 {
+                                    up = Some(i);
+                                }
+                                if ui.small_button("v").clicked() && i + 1 < n {
+                                    down = Some(i);
+                                }
+                                if ui
+                                    .selectable_label(item.reverse, "rev")
+                                    .on_hover_text("Reverse direction")
+                                    .clicked()
+                                {
+                                    project.sequence[i].reverse = !item.reverse;
+                                }
+                                if ui.small_button("x").clicked() {
+                                    del = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = up {
+                            project.sequence.swap(i, i - 1);
+                        }
+                        if let Some(i) = down {
+                            project.sequence.swap(i, i + 1);
+                        }
+                        if let Some(i) = del {
+                            project.sequence.remove(i);
+                        }
+                        ui.separator();
+                        ui.add_space(4.0);
+                        if ui
+                            .add_sized([ui.available_width(), 30.0], egui::Button::new(RichText::new("Generate G-code").strong()).fill(theme::ACCENT))
+                            .clicked()
+                        {
+                            actions.push(Action::Generate);
+                        }
+                    }
+                    ProjectTab::Preview => {
+                        let m = &project.machine;
+                        ui.heading("Simulation");
+                        egui::Grid::new("pv_stats").num_columns(2).show(ui, |ui| {
+                            ui.label("Machine");
+                            ui.label(&m.name);
+                            ui.end_row();
+                            ui.label("End effector");
+                            ui.label(m.effector.kind.label());
+                            ui.end_row();
+                            ui.label("Path length");
+                            ui.label(format!("{:.1} mm", preview.path_len));
+                            ui.end_row();
+                            ui.label("Work moves");
+                            ui.label(preview.work_moves().to_string());
+                            ui.end_row();
+                            ui.label("Est. time");
+                            ui.label(preview::fmt_time(preview.total_time()));
+                            ui.end_row();
+                            ui.label("Axes");
+                            let own = |i: usize| match m.axes[i] {
+                                AxisOwner::EndEffector => "tool",
+                                AxisOwner::Bed => "bed",
+                            };
+                            ui.label(format!("X {}  Y {}  Z {}", own(0), own(1), own(2)));
+                            ui.end_row();
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Time is estimated from the feed rates. Delays and acceleration are not included.")
+                                .small()
+                                .weak(),
+                        );
+                        for w in warnings.iter() {
+                            ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
+                        }
+                    }
                 }
             });
         });
 
-        if !gcode.is_empty() && *gcode_open {
+        if *tab == ProjectTab::Prepare && !gcode.is_empty() && *gcode_open {
             egui::Panel::bottom("gcode_panel")
                 .resizable(true)
                 .default_size(180.0)
@@ -604,253 +713,458 @@ impl App {
                 });
         }
 
+        if *tab == ProjectTab::Preview {
+            egui::Panel::bottom("preview_bar").show(root, |ui| {
+                let total = preview.total_time();
+                ui.horizontal(|ui| {
+                    let label = if preview.playing { "Pause" } else if preview.time >= total { "Replay" } else { "Play" };
+                    if ui.button(label).clicked() {
+                        if preview.playing {
+                            preview.playing = false;
+                        } else {
+                            if preview.time >= total {
+                                preview.time = 0.0;
+                            }
+                            preview.playing = true;
+                        }
+                    }
+                    if ui.button("Reset").clicked() {
+                        preview.time = 0.0;
+                        preview.playing = false;
+                    }
+                    let w = (ui.available_width() - 260.0).max(100.0);
+                    ui.spacing_mut().slider_width = w;
+                    let mut t = preview.time;
+                    if ui
+                        .add(egui::Slider::new(&mut t, 0.0..=total.max(0.001)).show_value(false))
+                        .changed()
+                    {
+                        preview.time = t;
+                        preview.playing = false;
+                    }
+                    ui.monospace(format!("{} / {}", preview::fmt_time(preview.time), preview::fmt_time(total)));
+                    egui::ComboBox::from_id_salt("pv_speed")
+                        .width(60.0)
+                        .selected_text(format!("{}x", preview::SPEEDS[preview.speed_idx]))
+                        .show_ui(ui, |ui| {
+                            for (i, s) in preview::SPEEDS.iter().enumerate() {
+                                ui.selectable_value(&mut preview.speed_idx, i, format!("{s}x"));
+                            }
+                        });
+                });
+            });
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    ui.selectable_value(&mut canvas.tool, Tool::Move, "Move part");
-                    ui.selectable_value(&mut canvas.tool, Tool::Sequence, "Sequence paths");
-                    if ui.button("Zoom fit").clicked() {
-                        canvas.zoom_fit();
-                    }
-                    ui.label(
-                        RichText::new("Wheel: zoom   Right or middle drag: pan")
-                            .small()
-                            .weak(),
-                    );
-                });
-                canvas.show(ui, project);
+            .show(root, |ui| match *tab {
+                ProjectTab::Prepare | ProjectTab::PathSelection => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        if ui.button("Zoom fit").clicked() {
+                            canvas.zoom_fit();
+                        }
+                        let hint = if *tab == ProjectTab::Prepare {
+                            "Drag a part to place it.   Wheel: zoom   Right or middle drag: pan"
+                        } else {
+                            "Click paths to build the order.   Wheel: zoom   Right or middle drag: pan"
+                        };
+                        ui.label(RichText::new(hint).small().weak());
+                    });
+                    canvas.show(ui, project);
+                }
+                ProjectTab::Preview => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        if ui.button("Iso").clicked() {
+                            preview.view_iso();
+                        }
+                        if ui.button("Top").clicked() {
+                            preview.view_top();
+                        }
+                        if ui.button("Front").clicked() {
+                            preview.view_front();
+                        }
+                        ui.checkbox(&mut preview.show_travel, "Travel moves");
+                        ui.checkbox(&mut preview.show_full, "Whole path");
+                    });
+                    preview.show(ui, &project.machine);
+                }
             });
     }
 
     fn machines_screen(&mut self, root: &mut egui::Ui) {
-        let Self { lib, lib_dirty, machine_draft, .. } = self;
-        egui::CentralPanel::default().show(root, |ui| {
-            ui.heading("Machine management");
-            ui.add_space(6.0);
-            let flavor_names: Vec<String> = lib.flavors.iter().map(|f| f.name.clone()).collect();
-            let mut delete: Option<usize> = None;
-            egui::Grid::new("machines").striped(true).num_columns(6).show(ui, |ui| {
-                for h in ["Name", "X (mm)", "Y (mm)", "Z (mm)", "Flavor", ""] {
-                    ui.strong(h);
-                }
-                ui.end_row();
-                for (i, m) in lib.machines.iter_mut().enumerate() {
-                    *lib_dirty |= ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(160.0)).changed();
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut m.size_x).speed(1.0).range(1.0..=5000.0)).changed();
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut m.size_y).speed(1.0).range(1.0..=5000.0)).changed();
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut m.size_z).speed(1.0).range(1.0..=2000.0)).changed();
-                    egui::ComboBox::from_id_salt(("mflavor", i))
-                        .selected_text(m.flavor.clone())
-                        .show_ui(ui, |ui| {
-                            for f in &flavor_names {
-                                *lib_dirty |= ui.selectable_value(&mut m.flavor, f.clone(), f).changed();
-                            }
-                        });
-                    if ui.button("Delete").clicked() {
-                        delete = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-            if let Some(i) = delete {
-                lib.machines.remove(i);
-                *lib_dirty = true;
-            }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.strong("Add machine");
-            egui::Grid::new("add_machine").num_columns(2).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut machine_draft.name);
-                ui.end_row();
-                ui.label("Size X (mm)");
-                ui.add(egui::DragValue::new(&mut machine_draft.size_x).speed(1.0).range(1.0..=5000.0));
-                ui.end_row();
-                ui.label("Size Y (mm)");
-                ui.add(egui::DragValue::new(&mut machine_draft.size_y).speed(1.0).range(1.0..=5000.0));
-                ui.end_row();
-                ui.label("Size Z (mm)");
-                ui.add(egui::DragValue::new(&mut machine_draft.size_z).speed(1.0).range(1.0..=2000.0));
-                ui.end_row();
-                ui.label("Flavor");
-                egui::ComboBox::from_id_salt("draft_flavor")
-                    .selected_text(machine_draft.flavor.clone())
+        let ctx = root.ctx().clone();
+        let Self { lib, lib_dirty, machine_sel, machine_tab, rename, .. } = self;
+        *machine_sel = (*machine_sel).min(lib.machines.len().saturating_sub(1));
+
+        egui::Panel::left("machine_list").default_size(360.0).show(root, |ui| {
+            // Section 1: pick a machine, add, clone, rename.
+            let selected = lib
+                .machines
+                .get(*machine_sel)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| "(no machines)".into());
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("machine_pick")
+                    .width(130.0)
+                    .selected_text(selected)
                     .show_ui(ui, |ui| {
-                        for f in &flavor_names {
-                            ui.selectable_value(&mut machine_draft.flavor, f.clone(), f);
+                        for (i, m) in lib.machines.iter().enumerate() {
+                            ui.selectable_value(machine_sel, i, &m.name);
                         }
                     });
-                ui.end_row();
+                if ui.button("Add").clicked() {
+                    let name = unique_machine_name(&lib.machines, "New machine");
+                    lib.machines.push(Machine::new(&name));
+                    *machine_sel = lib.machines.len() - 1;
+                    *lib_dirty = true;
+                }
+                let has = !lib.machines.is_empty();
+                if ui.add_enabled(has, egui::Button::new("Clone")).clicked() {
+                    let mut m = lib.machines[*machine_sel].clone();
+                    m.name = unique_machine_name(&lib.machines, &format!("{} copy", m.name));
+                    lib.machines.push(m);
+                    *machine_sel = lib.machines.len() - 1;
+                    *lib_dirty = true;
+                }
+                if ui.add_enabled(has, egui::Button::new("Rename")).clicked() {
+                    *rename = Some(lib.machines[*machine_sel].name.clone());
+                }
+                if ui.add_enabled(has, egui::Button::new("Delete")).clicked() {
+                    lib.machines.remove(*machine_sel);
+                    *machine_sel = (*machine_sel).min(lib.machines.len().saturating_sub(1));
+                    *lib_dirty = true;
+                }
             });
-            if ui.button("Add machine").clicked() && !machine_draft.name.trim().is_empty() {
-                lib.machines.push(machine_draft.clone());
-                *lib_dirty = true;
-            }
-        });
-    }
 
-    fn flavors_screen(&mut self, root: &mut egui::Ui) {
-        let Self { lib, lib_dirty, flavor_sel, log, .. } = self;
-        *flavor_sel = (*flavor_sel).min(lib.flavors.len().saturating_sub(1));
-
-        egui::Panel::left("flavor_list").default_size(200.0).show(root, |ui| {
-            ui.heading("Flavors");
-            for (i, f) in lib.flavors.iter().enumerate() {
-                ui.selectable_value(flavor_sel, i, &f.name);
-            }
+            // Section 2: menu.
             ui.separator();
-            if ui.button("New from selected").clicked() {
-                let mut f = lib.flavors[*flavor_sel].clone();
-                f.name = format!("{} copy", f.name);
-                lib.flavors.push(f);
-                *flavor_sel = lib.flavors.len() - 1;
-                *lib_dirty = true;
-            }
-            if ui.button("New GRBL preset").clicked() {
-                let mut f = Flavor::grbl();
-                f.name = unique_name(&lib.flavors, "GRBL");
-                lib.flavors.push(f);
-                *flavor_sel = lib.flavors.len() - 1;
-                *lib_dirty = true;
-            }
-            if ui.button("New Marlin preset").clicked() {
-                let mut f = Flavor::marlin();
-                f.name = unique_name(&lib.flavors, "Marlin");
-                lib.flavors.push(f);
-                *flavor_sel = lib.flavors.len() - 1;
-                *lib_dirty = true;
-            }
-            let used = lib.machines.iter().any(|m| m.flavor == lib.flavors[*flavor_sel].name);
-            let can_delete = lib.flavors.len() > 1 && !used;
-            let del = ui
-                .add_enabled(can_delete, egui::Button::new("Delete selected"))
-                .on_disabled_hover_text("Keep at least one flavor, and not one used by a machine.");
-            if del.clicked() {
-                lib.flavors.remove(*flavor_sel);
-                *lib_dirty = true;
+            for (tab, label) in [
+                (MachineTab::Machine, "Machine"),
+                (MachineTab::Speed, "Speed"),
+                (MachineTab::EndEffector, "End-Effector"),
+                (MachineTab::Scripts, "Scripts"),
+            ] {
+                ui.selectable_value(machine_tab, tab, label);
             }
         });
 
         egui::CentralPanel::default().show(root, |ui| {
-            if lib.flavors.is_empty() {
+            let Some(m) = lib.machines.get_mut(*machine_sel) else {
+                ui.heading("Machines");
+                ui.label("No machines yet. Use Add.");
                 return;
-            }
-            let Library { machines, flavors } = lib;
-            let f = &mut flavors[*flavor_sel];
+            };
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Flavor editor");
-                ui.label(
-                    RichText::new("A flavor is plain text. Change any command to match your firmware.")
-                        .small()
-                        .weak(),
-                );
-                let old_name = f.name.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    if ui.text_edit_singleline(&mut f.name).changed() {
-                        for m in machines.iter_mut().filter(|m| m.flavor == old_name) {
-                            m.flavor = f.name.clone();
-                        }
-                        *lib_dirty = true;
-                    }
-                });
-                ui.label("Header lines");
-                *lib_dirty |= ui
-                    .add(egui::TextEdit::multiline(&mut f.header).code_editor().desired_rows(3).desired_width(f32::INFINITY))
-                    .changed();
-                ui.label("Footer lines");
-                *lib_dirty |= ui
-                    .add(egui::TextEdit::multiline(&mut f.footer).code_editor().desired_rows(2).desired_width(f32::INFINITY))
-                    .changed();
-                egui::Grid::new("fl_grid").num_columns(2).show(ui, |ui| {
-                    ui.label("Valve on");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.valve_on).changed();
-                    ui.end_row();
-                    ui.label("Valve off");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.valve_off).changed();
-                    ui.end_row();
-                    ui.label("Dwell template");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.dwell).changed();
-                    ui.end_row();
-                    ui.label("");
-                    ui.label(RichText::new("{ms} = milliseconds, {s} = seconds").small().weak());
-                    ui.end_row();
-                    ui.label("Rapid command");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.rapid_cmd).changed();
-                    ui.end_row();
-                    ui.label("Linear command");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.linear_cmd).changed();
-                    ui.end_row();
-                    ui.label("Arc output (G2/G3)");
-                    *lib_dirty |= ui.checkbox(&mut f.arcs, "").changed();
-                    ui.end_row();
-                    ui.label("Clockwise arc");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.cw_cmd).changed();
-                    ui.end_row();
-                    ui.label("Counter-clockwise arc");
-                    *lib_dirty |= ui.text_edit_singleline(&mut f.ccw_cmd).changed();
-                    ui.end_row();
-                    ui.label("");
-                    ui.label(RichText::new("Arcs use I/J (center relative to start). Marlin needs ARC_SUPPORT.").small().weak());
-                    ui.end_row();
-                    ui.label("F on rapid moves");
-                    *lib_dirty |= ui.checkbox(&mut f.rapid_with_feed, "").changed();
-                    ui.end_row();
-                    ui.label("Decimals");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut f.decimals).range(0..=6)).changed();
-                    ui.end_row();
-                    ui.label("Comments in output");
-                    *lib_dirty |= ui.checkbox(&mut f.comments, "").changed();
-                    ui.end_row();
-                });
-                ui.separator();
-                ui.strong("Default job settings for new projects");
-                let j = &mut f.defaults;
-                egui::Grid::new("fl_job").num_columns(2).show(ui, |ui| {
-                    ui.label("Dispense feed");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.dispense_feed).speed(5.0).suffix(" mm/min")).changed();
-                    ui.end_row();
-                    ui.label("Travel feed");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).suffix(" mm/min")).changed();
-                    ui.end_row();
-                    ui.label("Use Z axis");
-                    *lib_dirty |= ui.checkbox(&mut j.use_z, "").changed();
-                    ui.end_row();
-                    ui.label("Safe Z");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm")).changed();
-                    ui.end_row();
-                    ui.label("Dispense Z");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm")).changed();
-                    ui.end_row();
-                    ui.label("Pre-flow wait");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.pre_flow_ms).speed(5.0).suffix(" ms")).changed();
-                    ui.end_row();
-                    ui.label("Post-flow wait");
-                    *lib_dirty |= ui.add(egui::DragValue::new(&mut j.post_flow_ms).speed(5.0).suffix(" ms")).changed();
-                    ui.end_row();
-                });
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Presets are untested on real machines. Check every command against your firmware before running.")
-                        .small()
-                        .color(Color32::from_rgb(0xff, 0xb0, 0x40)),
-                );
+                let mut ch = false;
+                match *machine_tab {
+                    MachineTab::Machine => machine_section(ui, m, &mut ch),
+                    MachineTab::Speed => speed_section(ui, m, &mut ch),
+                    MachineTab::EndEffector => end_effector_section(ui, m, &mut ch),
+                    MachineTab::Scripts => scripts_section(ui, m, &mut ch),
+                }
+                *lib_dirty |= ch;
             });
-            let _ = log;
         });
+
+        // Rename dialog.
+        if let Some(name) = rename.as_mut() {
+            let mut open = true;
+            let mut ok = false;
+            let mut cancel = false;
+            let taken = lib
+                .machines
+                .iter()
+                .enumerate()
+                .any(|(i, m)| i != *machine_sel && m.name == name.trim());
+            egui::Window::new("Rename machine")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.text_edit_singleline(name);
+                    if taken {
+                        ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), "Another machine has this name.");
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!name.trim().is_empty() && !taken, egui::Button::new("OK"))
+                            .clicked()
+                        {
+                            ok = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if ok {
+                if let (Some(n), Some(m)) = (rename.take(), lib.machines.get_mut(*machine_sel)) {
+                    m.name = n.trim().to_string();
+                    *lib_dirty = true;
+                }
+            } else if cancel || !open {
+                *rename = None;
+            }
+        }
     }
 }
 
-fn unique_name(flavors: &[Flavor], base: &str) -> String {
-    if !flavors.iter().any(|f| f.name == base) {
+fn unique_machine_name(machines: &[Machine], base: &str) -> String {
+    if !machines.iter().any(|m| m.name == base) {
         return base.to_string();
     }
     (2..)
         .map(|n| format!("{base} {n}"))
-        .find(|c| !flavors.iter().any(|f| &f.name == c))
+        .find(|c| !machines.iter().any(|m| &m.name == c))
         .unwrap()
+}
+
+fn machine_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool) {
+    ui.heading("Machine");
+    ui.add_space(4.0);
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.strong("Machine construction");
+            egui::Grid::new("m_build").num_columns(5).striped(true).show(ui, |ui| {
+                for h in ["Axis", "Travel (mm)", "Bed size (mm)", "Moves the", ""] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                let names = ["X", "Y", "Z"];
+                let travel = [&mut m.travel_x, &mut m.travel_y, &mut m.travel_z];
+                let bed = [&mut m.bed_x, &mut m.bed_y, &mut m.bed_z];
+                for (i, (t, b)) in travel.into_iter().zip(bed).enumerate() {
+                    ui.label(names[i]);
+                    *ch |= ui.add(egui::DragValue::new(t).speed(1.0).range(1.0..=5000.0)).changed();
+                    *ch |= ui.add(egui::DragValue::new(b).speed(1.0).range(1.0..=5000.0)).changed();
+                    ui.horizontal(|ui| {
+                        *ch |= ui.radio_value(&mut m.axes[i], AxisOwner::EndEffector, "End effector").changed();
+                        *ch |= ui.radio_value(&mut m.axes[i], AxisOwner::Bed, "Bed").changed();
+                    });
+                    ui.label("");
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.strong("Bed & End-Effector Positions");
+            let (bp, ep) = (m.bed_position(), m.effector_position());
+            egui::Grid::new("m_fixed").num_columns(4).striped(true).show(ui, |ui| {
+                for h in ["Axis", "End effector (mm)", "Bed (mm)", ""] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (i, name) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.label(*name);
+                    // Only the part that stays fixed on an axis has a position.
+                    let fixed_z = i == 2;
+                    if m.axes[i] == AxisOwner::Bed {
+                        let mut v = ep[i];
+                        let (lo, hi) = m.effector_range(i);
+                        let r = ui.add_enabled(!fixed_z, egui::DragValue::new(&mut v).speed(0.5).range(lo..=hi));
+                        if r.changed() {
+                            m.effector_pos[i] = v;
+                            *ch = true;
+                        }
+                    } else {
+                        ui.label("-");
+                    }
+                    if m.axes[i] == AxisOwner::EndEffector {
+                        let mut v = bp[i];
+                        let (lo, hi) = m.bed_range(i);
+                        let r = ui.add_enabled(!fixed_z, egui::DragValue::new(&mut v).speed(0.5).range(lo..=hi));
+                        if r.changed() {
+                            m.bed_pos[i] = v;
+                            *ch = true;
+                        }
+                    } else {
+                        ui.label("-");
+                    }
+                    if ui.small_button("Reset").clicked() {
+                        m.effector_pos[i] = -1.0;
+                        m.bed_pos[i] = -1.0;
+                        *ch = true;
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.strong("Home Positions");
+            let hm = m.home_position();
+            egui::Grid::new("m_home").num_columns(3).striped(true).show(ui, |ui| {
+                for h in ["Axis", "Homing (mm)", ""] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for (i, name) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.label(*name);
+                    let mut hv = hm[i];
+                    if ui.add(egui::DragValue::new(&mut hv).speed(0.5).range(-5000.0..=5000.0)).changed() {
+                        m.home[i] = Some(hv);
+                        *ch = true;
+                    }
+                    if ui.small_button("Reset").clicked() {
+                        m.home[i] = None;
+                        *ch = true;
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            ui.strong("Z heights");
+            egui::Grid::new("m_z").num_columns(2).show(ui, |ui| {
+                let j = &mut m.job;
+                ui.label("Use Z axis");
+                *ch |= ui.checkbox(&mut j.use_z, "").changed();
+                ui.end_row();
+                ui.add_enabled_ui(j.use_z, |ui| ui.label("Safe Z"));
+                *ch |= ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm")).changed();
+                ui.end_row();
+                ui.add_enabled_ui(j.use_z, |ui| ui.label("Work Z"));
+                *ch |= ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm")).changed();
+                ui.end_row();
+            });
+        });
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            preview::Preview::show_schematic(ui, &*m, egui::vec2(400.0, 330.0));
+        });
+    });
+}
+
+fn speed_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool) {
+    ui.heading("Speed");
+    ui.add_space(4.0);
+    egui::Grid::new("m_speed").num_columns(2).show(ui, |ui| {
+        ui.label("Work feed");
+        *ch |= ui
+            .add(egui::DragValue::new(&mut m.job.dispense_feed).speed(5.0).range(1.0..=20000.0).suffix(" mm/min"))
+            .changed();
+        ui.end_row();
+        ui.label("Travel feed");
+        *ch |= ui
+            .add(egui::DragValue::new(&mut m.job.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"))
+            .changed();
+        ui.end_row();
+        ui.label("F on rapid moves");
+        *ch |= ui.checkbox(&mut m.gcode.rapid_with_feed, "").changed();
+        ui.end_row();
+    });
+}
+
+fn end_effector_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool) {
+    ui.heading("End-Effector");
+    ui.add_space(4.0);
+    let e = &mut m.effector;
+    egui::Grid::new("m_ee").num_columns(2).show(ui, |ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt("ee_kind")
+            .selected_text(e.kind.label())
+            .show_ui(ui, |ui| {
+                for k in EffectorKind::ALL {
+                    *ch |= ui.selectable_value(&mut e.kind, k, k.label()).changed();
+                }
+            });
+        ui.end_row();
+        ui.label("");
+        ui.label(RichText::new("Used for the simulation drawing only.").small().weak());
+        ui.end_row();
+        ui.label("Control");
+        ui.horizontal(|ui| {
+            *ch |= ui.radio_value(&mut e.control, ControlType::Binary, "Binary").changed();
+            *ch |= ui.radio_value(&mut e.control, ControlType::Pwm, "PWM").changed();
+        });
+        ui.end_row();
+        match e.control {
+            ControlType::Binary => {
+                ui.label("On command");
+                *ch |= ui.text_edit_singleline(&mut e.on_cmd).changed();
+                ui.end_row();
+                ui.label("Off command");
+                *ch |= ui.text_edit_singleline(&mut e.off_cmd).changed();
+                ui.end_row();
+            }
+            ControlType::Pwm => {
+                ui.label("PWM command");
+                *ch |= ui.text_edit_singleline(&mut e.pwm_cmd).changed();
+                ui.end_row();
+                ui.label("");
+                ui.label(RichText::new("{v} is replaced by the PWM value.").small().weak());
+                ui.end_row();
+                ui.label("PWM min (off)");
+                *ch |= ui.add(egui::DragValue::new(&mut e.pwm_min).speed(1.0)).changed();
+                ui.end_row();
+                ui.label("PWM max (on)");
+                *ch |= ui.add(egui::DragValue::new(&mut e.pwm_max).speed(1.0)).changed();
+                ui.end_row();
+            }
+        }
+        ui.label("Start delay");
+        *ch |= ui.add(egui::DragValue::new(&mut m.job.on_delay_ms).speed(5.0).suffix(" ms")).changed();
+        ui.end_row();
+        ui.label("Stop delay");
+        *ch |= ui.add(egui::DragValue::new(&mut m.job.off_delay_ms).speed(5.0).suffix(" ms")).changed();
+        ui.end_row();
+    });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!(
+            "Output: on = \"{}\"   off = \"{}\"",
+            m.effector.on_line(),
+            m.effector.off_line()
+        ))
+        .small()
+        .monospace(),
+    );
+}
+
+fn scripts_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool) {
+    ui.heading("Scripts");
+    ui.add_space(4.0);
+    ui.label("Pre script (written at the start)");
+    *ch |= ui
+        .add(egui::TextEdit::multiline(&mut m.pre_script).code_editor().desired_rows(5).desired_width(f32::INFINITY))
+        .changed();
+    ui.add_space(6.0);
+    ui.label("Post script (written at the end)");
+    *ch |= ui
+        .add(egui::TextEdit::multiline(&mut m.post_script).code_editor().desired_rows(4).desired_width(f32::INFINITY))
+        .changed();
+    ui.add_space(8.0);
+    ui.separator();
+    ui.strong("G-code format");
+    let g = &mut m.gcode;
+    egui::Grid::new("m_fmt").num_columns(2).show(ui, |ui| {
+        ui.label("Dwell template");
+        *ch |= ui.text_edit_singleline(&mut g.dwell).changed();
+        ui.end_row();
+        ui.label("");
+        ui.label(RichText::new("{ms} = milliseconds, {s} = seconds").small().weak());
+        ui.end_row();
+        ui.label("Rapid command");
+        *ch |= ui.text_edit_singleline(&mut g.rapid_cmd).changed();
+        ui.end_row();
+        ui.label("Linear command");
+        *ch |= ui.text_edit_singleline(&mut g.linear_cmd).changed();
+        ui.end_row();
+        ui.label("Arc output (G2/G3)");
+        *ch |= ui.checkbox(&mut g.arcs, "").changed();
+        ui.end_row();
+        ui.label("Clockwise arc");
+        *ch |= ui.text_edit_singleline(&mut g.cw_cmd).changed();
+        ui.end_row();
+        ui.label("Counter-clockwise arc");
+        *ch |= ui.text_edit_singleline(&mut g.ccw_cmd).changed();
+        ui.end_row();
+        ui.label("Decimals");
+        *ch |= ui.add(egui::DragValue::new(&mut g.decimals).range(0..=6)).changed();
+        ui.end_row();
+        ui.label("Comments in output");
+        *ch |= ui.checkbox(&mut g.comments, "").changed();
+        ui.end_row();
+    });
 }
 
 impl eframe::App for App {
@@ -863,7 +1177,6 @@ impl eframe::App for App {
         match self.screen {
             Screen::Project => self.project_screen(root, &mut actions),
             Screen::Machines => self.machines_screen(root),
-            Screen::Flavors => self.flavors_screen(root),
         }
         self.new_project_window(&ctx);
         self.layer_window(&ctx);

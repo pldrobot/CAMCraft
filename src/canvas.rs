@@ -111,13 +111,19 @@ impl Canvas {
         let avail = ui.available_size();
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let rect = resp.rect;
-        let (bx, by) = (project.machine.size_x, project.machine.size_y);
+        let bg = project.machine.bed_in_gcode();
+        let (bx, by) = (project.machine.bed_x, project.machine.bed_y);
+        let (x0, y0, x1, y1) = (bg[0].0, bg[1].0, bg[0].1, bg[1].1);
+        let wk = project.machine.workable();
 
         if self.fit {
-            let sx = rect.width() as f64 / (bx * 1.15).max(1.0);
-            let sy = rect.height() as f64 / (by * 1.15).max(1.0);
+            // Fit the bed and the origin.
+            let (fx0, fy0) = (x0.min(0.0), y0.min(0.0));
+            let (fw, fh) = (x1 - fx0, y1 - fy0);
+            let sx = rect.width() as f64 / (fw * 1.15).max(1.0);
+            let sy = rect.height() as f64 / (fh * 1.15).max(1.0);
             self.scale = sx.min(sy).max(0.05) as f32;
-            self.center = [bx / 2.0, by / 2.0];
+            self.center = [fx0 + fw / 2.0, fy0 + fh / 2.0];
             self.fit = false;
         }
 
@@ -196,8 +202,13 @@ impl Canvas {
         // ---- drawing ----
         painter.rect_filled(rect, CornerRadius::ZERO, CANVAS_BG);
 
-        let bed = Rect::from_two_pos(xf.w2s([0.0, 0.0]), xf.w2s([bx, by]));
+        let bed = Rect::from_two_pos(xf.w2s([x0, y0]), xf.w2s([x1, y1]));
         painter.rect_filled(bed, CornerRadius::ZERO, BED_FILL);
+        let work = Rect::from_two_pos(xf.w2s([wk[0].0, wk[1].0]), xf.w2s([wk[0].1, wk[1].1]));
+        let work_ok = wk[0].1 > wk[0].0 && wk[1].1 > wk[1].0;
+        if work_ok {
+            painter.rect_filled(work, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x3f, 0xc1, 0x6b, 22));
+        }
 
         // Grid inside the bed.
         let steps = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0];
@@ -207,27 +218,37 @@ impl Canvas {
             .find(|s| s * self.scale as f64 >= 14.0)
             .unwrap_or(200.0);
         let major = step * 5.0;
-        let mut x = 0.0;
-        while x <= bx + 1e-9 {
+        let mut x = (x0 / step).ceil() * step;
+        while x <= x1 + 1e-9 {
             let is_major = (x / major - (x / major).round()).abs() < 1e-6;
-            let a = xf.w2s([x, 0.0]);
-            let b = xf.w2s([x, by]);
+            let a = xf.w2s([x, y0]);
+            let b = xf.w2s([x, y1]);
             painter.line_segment([a, b], Stroke::new(1.0, if is_major { GRID_MAJOR } else { GRID_MINOR }));
             x += step;
         }
-        let mut y = 0.0;
-        while y <= by + 1e-9 {
+        let mut y = (y0 / step).ceil() * step;
+        while y <= y1 + 1e-9 {
             let is_major = (y / major - (y / major).round()).abs() < 1e-6;
-            let a = xf.w2s([0.0, y]);
-            let b = xf.w2s([bx, y]);
+            let a = xf.w2s([x0, y]);
+            let b = xf.w2s([x1, y]);
             painter.line_segment([a, b], Stroke::new(1.0, if is_major { GRID_MAJOR } else { GRID_MINOR }));
             y += step;
         }
-        painter.rect_stroke(bed, CornerRadius::ZERO, Stroke::new(1.5, BED_EDGE), StrokeKind::Middle);
+        painter.rect_stroke(bed, CornerRadius::ZERO, Stroke::new(1.5, Color32::from_rgb(0x7a, 0x86, 0x92)), StrokeKind::Middle);
+        if work_ok {
+            painter.rect_stroke(work, CornerRadius::ZERO, Stroke::new(1.5, BED_EDGE), StrokeKind::Middle);
+        }
         painter.text(
             bed.left_top() + egui::vec2(0.0, -4.0),
             Align2::LEFT_BOTTOM,
-            format!("{} - {} x {} mm", project.machine.name, bx, by),
+            format!(
+                "{}  bed {} x {} mm (grey)   workable {:.0} x {:.0} mm (green)",
+                project.machine.name,
+                bx,
+                by,
+                (wk[0].1 - wk[0].0).max(0.0),
+                (wk[1].1 - wk[1].0).max(0.0)
+            ),
             FontId::proportional(12.0),
             BED_EDGE,
         );
@@ -246,15 +267,15 @@ impl Canvas {
                 let outside = project
                     .world_points(&SeqItem { part: pi, path: ci, reverse: false })
                     .iter()
-                    .any(|p| p[0] < 0.0 || p[1] < 0.0 || p[0] > bx || p[1] > by);
+                    .any(|p| !project.machine.in_workable(*p));
                 let in_seq = project.seq_index(pi, ci).is_some();
                 let hovered = hit == Some((pi, ci)) && self.tool == Tool::Sequence;
                 let color = if hovered {
                     PATH_HOVER
-                } else if in_seq {
-                    PATH_SEQ
                 } else if outside {
                     PATH_OUTSIDE
+                } else if in_seq {
+                    PATH_SEQ
                 } else if self.selected_part == Some(pi) {
                     PATH_PART_SELECTED
                 } else {

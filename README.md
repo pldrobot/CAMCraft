@@ -10,8 +10,7 @@ Needs the Rust toolchain (rustup). Tested to build on Linux only. Windows build 
 
 ## Workflow
 
-1. Flavors: define the G-code dialect (header, footer, valve on/off, dwell template, commands). GRBL and Marlin presets are included and editable.
-2. Machines: add a machine with name, X/Y/Z size and flavor.
+1. Machines: pick a machine from the list (Add, Clone, Rename, Delete). Sections: Machine (construction, positions, home, Z heights), Speed, End-Effector (type, Binary or PWM control, delays) and Scripts (pre and post script, G-code format).
 3. File > New Project, pick a machine. The bed appears.
 4. Insert DXF, then drag it on the bed (Move part tool) or type X/Y in the left panel.
 5. Sequence paths tool: click paths in the order to glue. Use ^ v to reorder, rev to flip direction.
@@ -19,7 +18,7 @@ Needs the Rust toolchain (rustup). Tested to build on Linux only. Windows build 
 
 Mouse: wheel zoom, right or middle drag pan.
 
-Data: machines and flavors are stored in the user config folder (CAMCraft/library.json). Projects are saved as .camcraft (JSON).
+Data: machines are stored in the user config folder (CAMCraft/library.json). Projects are saved as .camcraft (JSON).
 
 ## Supported DXF entities
 

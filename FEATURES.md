@@ -14,18 +14,18 @@ Use this file as the working checklist in VS Code. Tick items as you finish them
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | App window, screens (Project, Machines, Flavors), file dialogs, actions |
-| `src/model.rs` | Flavor, Machine, Project, Part, PathData, library storage (JSON) |
+| `src/main.rs` | App window, screens (Project, Machines), file dialogs, actions |
+| `src/model.rs` | GcodeStyle, Machine, Project, Part, PathData, library storage (JSON) |
 | `src/dxf_import.rs` | DXF to paths: flatten arcs and splines, join touching entities |
-| `src/gcode.rs` | Flavor-driven G-code generator (has unit tests) |
+| `src/gcode.rs` | Machine-driven G-code generator (has unit tests) |
 | `src/canvas.rs` | Bed view: grid, zoom, pan, drag part, click to sequence |
 | `src/theme.rs` | AutoCAD-style dark colours |
 
 ## Done in v0.1
 
-- [x] Flavor management: add, copy, delete, edit. Presets for GRBL and Marlin.
-- [x] Flavor fields: header, footer, valve on/off, dwell template (`{ms}` or `{s}`), rapid and linear commands, F on rapid, decimals, comments, default job settings.
-- [x] Machine management: name, X/Y/Z size, flavor. Edit and delete in place.
+- [x] Machine management: pick, add, clone, rename, delete. Flavors were removed; all G-code settings live on the machine.
+- [x] Machine G-code settings (Scripts and Speed sections): pre and post script, dwell template (`{ms}` or `{s}`), rapid and linear commands, F on rapid, decimals, comments, default job settings.
+- [x] Machine management: bed size, axis travel, which axes move the end effector or the bed, end effector type (Motor, Laser, Glue, Other) and control (Binary on/off commands, or PWM with min and max).
 - [x] Library saved automatically in the user config folder (`CAMCraft/library.json`).
 - [x] New Project: choose a machine, the bed appears.
 - [x] Insert DXF: LINE, LWPOLYLINE, POLYLINE (bulges), ARC, CIRCLE, SPLINE.
@@ -45,8 +45,7 @@ Use this file as the working checklist in VS Code. Tick items as you finish them
 - [ ] Output uses G1 lines only, no G2/G3 arcs.
 - [ ] DXF units assumed mm. No unit detection.
 - [ ] No undo or redo.
-- [ ] Opening a project does not check that its flavor still exists (shows an error when generating).
-- [ ] Machine and flavor names are not checked for duplicates.
+- [ ] Machine names are checked for duplicates only in Add, Clone and Rename.
 - [ ] Generated G-code never run on a real machine.
 
 ## Next features (suggested order)
@@ -95,3 +94,6 @@ Use this file as the working checklist in VS Code. Tick items as you finish them
 - "Add G2/G3 arc output as a flavor option. Keep the existing G1 output as the default and add tests."
 - "Add auto-sequence (nearest neighbour from the origin) as a button next to Add all, with a test."
 - "Add DXF unit detection from $INSUNITS with a manual override in the Insert DXF flow."
+
+- [x] Project tabs: Prepare, Path selection, Preview. Preview is a 3D toolpath simulation (orbit, pan, zoom, play, speed). Enabled after G-code is generated.
+- [x] Machine size = bed + travel on each axis. Workable area = part of the bed the end effector can reach (never larger than the bed or the travel). Work zero is the lowest reachable point on the bed; G-code Z 0 is the bed top.
