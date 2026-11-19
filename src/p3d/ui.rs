@@ -3,7 +3,7 @@
 
 use super::gcode;
 use super::model::*;
-use super::step::{self, ImportJob};
+use super::step::{self, ImportJob, V3};
 use super::view::{Overlay, PickMode, StepViz, View3};
 use crate::icons;
 use crate::model::{AxisOwner, ControlType, JobSettings, Library};
@@ -28,7 +28,8 @@ pub struct P3App {
     pub path: Option<PathBuf>,
     view: View3,
     tab: Tab,
-    mode: PickMode,
+    /// What a Pick button of a step is choosing in the view.
+    pick: Pick,
     selected_body: Option<usize>,
     sel_steps: Vec<usize>,
     seq_drag: Option<usize>,
@@ -56,6 +57,7 @@ struct Task {
 }
 
 enum AddStep {
+    Path,
     Home,
     Goto,
     Pause,
@@ -73,7 +75,7 @@ impl P3App {
             path: None,
             view: View3::default(),
             tab: Tab::Prepare,
-            mode: PickMode::Edges,
+            pick: None,
             selected_body: None,
             sel_steps: vec![],
             seq_drag: None,
@@ -232,11 +234,12 @@ impl P3App {
         self.viz = p
             .sequence
             .iter()
-            .map(|s| match s.kind {
-                Kind3::Edge { .. } => StepViz { pts: p.step_points(s), is_path: true },
-                Kind3::Home => StepViz { pts: vec![home], is_path: false },
-                Kind3::Goto { x, y, z } => StepViz { pts: vec![[x, y, z]], is_path: false },
-                Kind3::Pause { .. } => StepViz { pts: vec![], is_path: false },
+            .enumerate()
+            .map(|(i, s)| match s.kind {
+                Kind3::Path => StepViz { pts: p.step_points(s), lead: p.lead_in_points(i), is_path: true },
+                Kind3::Home => StepViz { pts: vec![home], lead: vec![], is_path: false },
+                Kind3::Goto { x, y, z } => StepViz { pts: vec![[x, y, z]], lead: vec![], is_path: false },
+                Kind3::Pause { .. } => StepViz { pts: vec![], lead: vec![], is_path: false },
             })
             .collect();
     }
@@ -273,7 +276,7 @@ impl P3App {
                     ui.heading("Job settings");
                     job_grid(ui, &mut self.project.job);
                     ui.separator();
-                    sequence_ui(ui, &mut self.project, &mut self.sel_steps, &mut self.seq_drag, &mut self.mode);
+                    sequence_ui(ui, &mut self.project, &mut self.sel_steps, &mut self.seq_drag, &mut self.pick, &self.viz);
                     ui.separator();
                     ui.add_space(4.0);
                     if ui
@@ -385,9 +388,13 @@ impl P3App {
             });
         }
 
-        let Self { project, view, tab, mode, selected_body, sel_steps, viz, preview, gcode, cursor, msgs, lay_face, .. } = self;
+        let Self { project, view, tab, pick, selected_body, sel_steps, viz, preview, gcode, cursor, msgs, lay_face, .. } = self;
         let mut edge_click = None;
         let mut face_click = None;
+        let mut point_click = None;
+        if *tab != Tab::PathSelection {
+            *pick = None;
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(root, |ui| match *tab {
             Tab::Prepare | Tab::PathSelection => {
                 ui.horizontal(|ui| {
@@ -411,19 +418,24 @@ impl P3App {
                     }
                     if *tab == Tab::PathSelection {
                         ui.separator();
-                        ui.label("Pick");
-                        ui.selectable_value(mode, PickMode::Edges, "Edges").on_hover_text("Click an edge to add or remove it as a path.");
-                        ui.selectable_value(mode, PickMode::Surface, "Surface")
-                            .on_hover_text("Select steps in the list, then click a surface. The Z gap is measured from it.");
+                        match *pick {
+                            Some((i, t)) => {
+                                ui.label(format!("Click {} for step {}", t.label(), i + 1));
+                                if ui.button("Cancel").clicked() {
+                                    *pick = None;
+                                }
+                            }
+                            None => {
+                                ui.label(RichText::new("Open a step and press Pick to choose an edge, surface or point.").small().weak());
+                            }
+                        }
                     }
                     let hint = if *tab == Tab::Prepare && *lay_face {
                         "Click a flat face to lay it on the bed."
                     } else if *tab == Tab::Prepare {
                         "Drag a part to place it on the bed.   Drag empty space: orbit   Right drag: pan   Wheel: zoom"
-                    } else if *mode == PickMode::Edges {
-                        "Parts are locked. Click edges to add paths.   Drag: orbit   Right drag: pan   Wheel: zoom"
                     } else {
-                        "Select steps, then click a surface for their Z gap.   Drag: orbit   Right drag: pan"
+                        "Parts are locked.   Drag: orbit   Right drag: pan   Wheel: zoom   Esc: cancel a pick"
                     };
                     ui.label(RichText::new(hint).small().weak());
                 });
@@ -432,21 +444,35 @@ impl P3App {
                         .sequence
                         .iter()
                         .enumerate()
-                        .filter_map(|(i, s)| {
-                            s.surface.map(|f| (f, if sel_steps.contains(&i) { [60, 200, 216] } else { [196, 138, 138] }))
+                        .flat_map(|(i, s)| {
+                            let main = s.surface.map(|f| (f, if sel_steps.contains(&i) { [60, 200, 216] } else { [196, 138, 138] }));
+                            main.into_iter().chain(s.lead_surfaces.iter().map(|f| (*f, [128, 190, 120])))
                         })
                         .collect()
                 } else {
                     vec![]
                 };
                 let ov = Overlay {
-                    mode: if *tab == Tab::Prepare { if *lay_face { PickMode::LayFace } else { PickMode::Move } } else { *mode },
+                    mode: if *tab == Tab::Prepare {
+                        if *lay_face { PickMode::LayFace } else { PickMode::Move }
+                    } else {
+                        match pick.map(|p| p.1) {
+                            Some(Target::Path) => PickMode::Edges,
+                            Some(Target::Surface | Target::LeadSurfaces) => PickMode::Surface,
+                            Some(Target::Start | Target::Stop) => PickMode::Any,
+                            None => PickMode::Idle,
+                        }
+                    },
                     selected_body: if *tab == Tab::Prepare { *selected_body } else { None },
                     tints: &tints,
                     steps: viz,
                     show_steps: *tab == Tab::PathSelection,
                     sel_steps,
                 };
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    *pick = None;
+                    *lay_face = false;
+                }
                 let out = view.show(ui, project, &ov);
                 *cursor = out.cursor;
                 if let Some(b) = out.body_click {
@@ -454,6 +480,7 @@ impl P3App {
                 }
                 edge_click = out.edge_click;
                 face_click = out.face_click;
+                point_click = out.point_click;
             }
             Tab::Preview => {
                 ui.horizontal(|ui| {
@@ -480,17 +507,6 @@ impl P3App {
         });
 
         // Clicks in the view.
-        if let Some((b, e)) = edge_click {
-            if let Some(i) = project.edge_in_sequence(b, e) {
-                project.sequence.remove(i);
-                sel_steps.clear();
-            } else {
-                let at = sel_steps.iter().max().map_or(project.sequence.len(), |m| m + 1).min(project.sequence.len());
-                let step = project.new_edge_step(b, e);
-                project.sequence.insert(at, step);
-                *sel_steps = vec![at];
-            }
-        }
         if let (Some(f), Tab::Prepare) = (face_click, *tab) {
             if let Some(b) = project.bodies.get_mut(f.0) {
                 match b.lay_face_down(f.1) {
@@ -502,13 +518,45 @@ impl P3App {
                     Err(e) => msgs.push(e),
                 }
             }
-        } else if let Some(f) = face_click {
-            let targets: Vec<usize> = sel_steps.iter().copied().filter(|&i| project.sequence.get(i).is_some_and(|s| s.is_edge())).collect();
-            if targets.is_empty() {
-                msgs.push("Select a path step in the list first, then click a surface.".into());
-            }
-            for i in targets {
-                project.sequence[i].surface = Some(f);
+        } else if let Some((si, t)) = *pick {
+            // The thing picked goes to the step that asked for it.
+            let Some(st) = project.sequence.get_mut(si) else {
+                *pick = None;
+                return;
+            };
+            let done = match t {
+                Target::Path => edge_click.map(|e| st.path = Some(e)).is_some(),
+                Target::Surface => face_click.map(|f| st.surface = Some(f)).is_some(),
+                Target::LeadSurfaces => {
+                    // Stays active so several surfaces can be picked.
+                    if let Some(f) = face_click {
+                        match st.lead_surfaces.iter().position(|x| *x == f) {
+                            Some(k) => {
+                                st.lead_surfaces.remove(k);
+                            }
+                            None => st.lead_surfaces.push(f),
+                        }
+                    }
+                    false
+                }
+                Target::Start | Target::Stop => {
+                    // One click gives an edge, a surface or a point.
+                    let l = edge_click
+                        .map(|(b, e)| Limit::Edge(b, e))
+                        .or(face_click.map(|(b, f)| Limit::Surface(b, f)))
+                        .or(point_click.map(Limit::Point));
+                    if let Some(l) = l {
+                        if t == Target::Start {
+                            st.start = Some(l);
+                        } else {
+                            st.stop = Some(l);
+                        }
+                    }
+                    l.is_some()
+                }
+            };
+            if done {
+                *pick = None;
             }
         }
     }
@@ -648,9 +696,6 @@ fn job_grid(ui: &mut egui::Ui, j: &mut Job3) {
         ui.label("Travel feed");
         ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"));
         ui.end_row();
-        ui.label("Safe Z");
-        ui.add(egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm"));
-        ui.end_row();
         ui.label("Z gap").on_hover_text("Distance between the tool tip and the chosen surface.");
         ui.add(egui::DragValue::new(&mut j.z_gap).speed(0.05).suffix(" mm"));
         ui.end_row();
@@ -670,19 +715,47 @@ fn job_grid(ui: &mut egui::Ui, j: &mut Job3) {
     });
 }
 
+/// What a Pick button on a step is choosing in the view.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Path,
+    Surface,
+    Start,
+    Stop,
+    /// Surfaces the lead in follows; each click adds or removes one.
+    LeadSurfaces,
+}
+
+impl Target {
+    fn label(self) -> &'static str {
+        match self {
+            Target::Path => "the path edge",
+            Target::Surface => "the surface",
+            Target::Start => "the start (an edge or a surface; Ctrl+click for a point)",
+            Target::Stop => "the end (an edge or a surface; Ctrl+click for a point)",
+            Target::LeadSurfaces => "the surfaces the lead in follows (click one again to remove it, Esc when done)",
+        }
+    }
+}
+
+/// The step and target being picked in the view, if any.
+type Pick = Option<(usize, Target)>;
+
+fn toggle(pick: &mut Pick, i: usize, t: Target) {
+    *pick = if *pick == Some((i, t)) { None } else { Some((i, t)) };
+}
+
 fn step_desc(project: &Project3, s: &Step3) -> String {
     match s.kind {
-        Kind3::Edge { body, edge } => {
-            let name = project.bodies.get(body).map(|b| b.name.as_str()).unwrap_or("?");
-            format!(
-                "{} edge {}{}{}{}",
-                name,
-                edge + 1,
-                if s.surface.is_some() { "" } else { "  (no surface)" },
-                if s.reverse { "  (reversed)" } else { "" },
-                if s.customised() { "  *" } else { "" }
-            )
-        }
+        Kind3::Path => match s.path {
+            Some((b, e)) => format!(
+                "{} edge {}{}",
+                project.bodies.get(b).map(|x| x.name.as_str()).unwrap_or("?"),
+                e + 1,
+                if s.reverse { "  (reversed)" } else { "" }
+            ),
+            None => "Path: pick an edge".into(),
+        },
         Kind3::Home => "Home".into(),
         Kind3::Goto { x, y, z } => format!("Go to  X{x:.2}  Y{y:.2}  Z{z:.2}"),
         Kind3::Pause { ms } => format!("Pause  {ms} ms"),
@@ -705,68 +778,226 @@ fn override_row(ui: &mut egui::Ui, label: &str, ov: &mut Option<f64>, job: f64, 
     ui.end_row();
 }
 
-fn step_settings(ui: &mut egui::Ui, project_bodies: &[Body], step: &mut Step3, job: &Job3, mode: &mut PickMode) -> bool {
-    ui.set_min_width(260.0);
-    let mut pick_surface = false;
-    match &mut step.kind {
-        Kind3::Edge { .. } => {
-            let surf = match step.surface {
-                Some((b, f)) => format!("{} face {}", project_bodies.get(b).map(|x| x.name.as_str()).unwrap_or("?"), f + 1),
-                None => "none, Z follows the edge".to_string(),
-            };
-            ui.label(format!("Surface: {surf}"));
-            ui.horizontal(|ui| {
-                if ui.button("Pick surface").on_hover_text("Switches the view to surface picking for this step.").clicked() {
-                    *mode = PickMode::Surface;
-                    pick_surface = true;
+const BLUE: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x82, 0xd6);
+
+/// A section like in a SolidWorks property page: bold title, a chevron at the
+/// right and a rule under the header. Click the header to open or close it.
+fn section(ui: &mut egui::Ui, id: egui::Id, title: &str, default_open: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let open = ui.data_mut(|d| *d.get_temp_mut_or(id, default_open));
+    let head = ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(if open { "^" } else { "v" }).weak());
+        });
+    });
+    if ui.interact(head.response.rect, id.with("head"), egui::Sense::click()).clicked() {
+        ui.data_mut(|d| d.insert_temp(id, !open));
+    }
+    let y = head.response.rect.bottom() + 1.0;
+    let (l, r) = (head.response.rect.left(), head.response.rect.right());
+    ui.painter().line_segment([egui::pos2(l, y), egui::pos2(r, y)], egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+    ui.add_space(3.0);
+    if open {
+        add(ui);
+        ui.add_space(4.0);
+    }
+}
+
+/// An icon and a box that shows the selected element. Click the box to pick in
+/// the view (it turns blue while active); the x clears it.
+/// Returns (box clicked, cleared).
+fn select_box(ui: &mut egui::Ui, icon: icons::Icon, text: Option<String>, hint: &str, active: bool) -> (bool, bool) {
+    let (mut clicked, mut cleared) = (false, false);
+    ui.horizontal(|ui| {
+        icons::icon_label(ui, icon, BLUE);
+        let w = (ui.available_width() - 28.0).max(60.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+        let fill = if active { BLUE.gamma_multiply(0.30) } else { ui.visuals().extreme_bg_color };
+        let stroke = if active || resp.hovered() { egui::Stroke::new(1.5, BLUE) } else { ui.visuals().widgets.noninteractive.bg_stroke };
+        ui.painter().rect(rect, egui::CornerRadius::same(2), fill, stroke, egui::StrokeKind::Inside);
+        let (t, col) = match &text {
+            Some(t) => (t.as_str(), ui.visuals().text_color()),
+            None => (hint, ui.visuals().weak_text_color()),
+        };
+        ui.painter().with_clip_rect(rect.shrink(2.0)).text(rect.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, t, egui::FontId::proportional(13.0), col);
+        clicked = resp.clicked();
+        cleared = icons::icon_button_ex(ui, icons::Icon::Remove, "Clear", false, text.is_some()).clicked();
+    });
+    (clicked, cleared)
+}
+
+/// An offset in mm with the icon and a direction toggle. It shows the default
+/// (the tool offset) until it is changed; x puts the default back.
+fn offset_row(ui: &mut egui::Ui, val: &mut Option<f64>, default: f64, flip: Option<(&mut bool, (&str, &str), &str)>) {
+    ui.horizontal(|ui| {
+        icons::icon_label(ui, icons::Icon::Offset, BLUE);
+        let mut v = val.unwrap_or(default);
+        if ui.add(egui::DragValue::new(&mut v).speed(0.05).range(0.0..=10000.0).suffix(" mm")).changed() {
+            *val = Some(v);
+        }
+        if val.is_some() && ui.small_button("x").on_hover_text("Back to the default").clicked() {
+            *val = None;
+        }
+        if let Some((flip, names, tip)) = flip {
+            if icons::icon_button_ex(ui, icons::Icon::Reverse, tip, *flip, true).clicked() {
+                *flip = !*flip;
+            }
+            ui.label(RichText::new(if *flip { names.1 } else { names.0 }).small().weak());
+        }
+    });
+}
+
+fn limit_txt(names: &[String], l: Option<Limit>) -> Option<String> {
+    let part = |b: usize| names.get(b).map(String::as_str).unwrap_or("?");
+    match l? {
+        Limit::Point(p) => Some(format!("point {:.1}, {:.1}, {:.1}", p[0], p[1], p[2])),
+        Limit::Edge(b, e) => Some(format!("{} edge {}", part(b), e + 1)),
+        Limit::Surface(b, f) => Some(format!("{} face {}", part(b), f + 1)),
+    }
+}
+
+/// The Start or End section of a path step.
+#[allow(clippy::too_many_arguments)]
+fn limit_section(
+    ui: &mut egui::Ui,
+    i: usize,
+    start: bool,
+    limit: &mut Option<Limit>,
+    offset: &mut Option<f64>,
+    flip: &mut bool,
+    tool_r: f64,
+    names: &[String],
+    pick: &mut Pick,
+) {
+    let title = if start { "Start" } else { "End" };
+    let id = ui.make_persistent_id(("p3_sec", i, title));
+    section(ui, id, title, true, |ui| {
+        let icon = match limit {
+            Some(Limit::Point(_)) => icons::Icon::SelPoint,
+            Some(Limit::Surface(..)) => icons::Icon::SelFace,
+            _ => icons::Icon::SelEdge,
+        };
+        let target = if start { Target::Start } else { Target::Stop };
+        let hint = format!("Select the {} edge, surface or point", if start { "start" } else { "end" });
+        let (c, x) = select_box(ui, icon, limit_txt(names, *limit), &hint, *pick == Some((i, target)));
+        if c {
+            toggle(pick, i, target);
+        }
+        if x {
+            *limit = None;
+        }
+        offset_row(ui, offset, tool_r, Some((flip, ("Inward", "Outward"), "Direction of the offset: inward shortens the path from this end, outward lengthens it.")));
+    });
+}
+
+/// The options of an expanded step.
+fn step_body(ui: &mut egui::Ui, i: usize, s: &mut Step3, job: &Job3, names: &[String], pick: &mut Pick, around: (Option<V3>, Option<V3>)) {
+    let part = |b: usize| names.get(b).map(String::as_str).unwrap_or("?").to_string();
+    match s.kind {
+        Kind3::Path => {
+            let tool_r = job.with(&s.over).tool_diameter.max(0.0) / 2.0;
+            let cur = *pick;
+            let on = move |t: Target| cur == Some((i, t));
+            let (id_path, id_over, id_lead) = (ui.make_persistent_id(("p3_sec", i, "path")), ui.make_persistent_id(("p3_sec", i, "over")), ui.make_persistent_id(("p3_sec", i, "lead")));
+            section(ui, id_path, "Path", true, |ui| {
+                let txt = s.path.map(|(b, e)| format!("{} edge {}", part(b), e + 1));
+                let (c, x) = select_box(ui, icons::Icon::SelEdge, txt, "Select the path edge", on(Target::Path));
+                if c {
+                    toggle(pick, i, Target::Path);
                 }
-                if ui.add_enabled(step.surface.is_some(), egui::Button::new("Clear")).clicked() {
-                    step.surface = None;
+                if x {
+                    s.path = None;
+                }
+                let txt = s.surface.map(|(b, f)| format!("{} face {}", part(b), f + 1));
+                let (c, x) = select_box(ui, icons::Icon::SelFace, txt, "Select the surface (Z gap)", on(Target::Surface));
+                if c {
+                    toggle(pick, i, Target::Surface);
+                }
+                if x {
+                    s.surface = None;
+                }
+                offset_row(ui, &mut s.offset, tool_r, Some((&mut s.offset_flip, ("Outside", "Inside"), "Side of the path offset: outside is away from the surface, inside is toward it.")));
+            });
+            limit_section(ui, i, true, &mut s.start, &mut s.start_offset, &mut s.start_flip, tool_r, names, pick);
+            limit_section(ui, i, false, &mut s.stop, &mut s.stop_offset, &mut s.stop_flip, tool_r, names, pick);
+            section(ui, id_lead, "Lead in", true, |ui| {
+                ui.checkbox(&mut s.lead_in, "From the end of the previous step")
+                    .on_hover_text("The tool goes straight from where the previous step ended to the start of this path, without lifting. Needs a previous step.");
+                if s.lead_in {
+                    let n = s.lead_surfaces.len();
+                    let txt = (n > 0).then(|| format!("{n} surface{}", if n == 1 { "" } else { "s" }));
+                    let (c, x) = select_box(ui, icons::Icon::SelFace, txt, "Select the surfaces to follow (optional)", on(Target::LeadSurfaces));
+                    if c {
+                        toggle(pick, i, Target::LeadSurfaces);
+                    }
+                    if x {
+                        s.lead_surfaces.clear();
+                    }
+                    let mut remove = None;
+                    for (k, (b, f)) in s.lead_surfaces.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(26.0);
+                            ui.label(RichText::new(format!("{} face {}", part(*b), f + 1)).small());
+                            if ui.small_button("x").on_hover_text("Remove").clicked() {
+                                remove = Some(k);
+                            }
+                        });
+                    }
+                    if let Some(k) = remove {
+                        s.lead_surfaces.remove(k);
+                    }
+                    // How far the lead in keeps from those surfaces, on the side it is on.
+                    offset_row(ui, &mut s.lead_offset, tool_r, Some((&mut s.lead_flip, ("Same side", "Other side"), "If the lead in is not right, switch the side: it keeps to the other side of a wall, or goes round a post (or any solid in its way) on the other hand, right instead of left of its travel direction.")));
                 }
             });
-            ui.separator();
-            ui.label(RichText::new("Tick a value to change it for this path. Others follow Job settings.").small().weak());
-            egui::Grid::new("p3_step_over").num_columns(2).show(ui, |ui| {
-                override_row(ui, "Z gap", &mut step.gap, job.z_gap, 0.05, " mm");
-                override_row(ui, "Work feed", &mut step.feed, job.dispense_feed, 5.0, " mm/min");
+            section(ui, id_over, "Overrides of the job settings", false, |ui| {
+                let o = &mut s.over;
+                egui::Grid::new(("p3_over", i)).num_columns(2).show(ui, |ui| {
+                    override_row(ui, "Work feed", &mut o.feed, job.dispense_feed, 5.0, " mm/min");
+                    override_row(ui, "Travel feed", &mut o.travel_feed, job.travel_feed, 10.0, " mm/min");
+                    override_row(ui, "Z gap", &mut o.z_gap, job.z_gap, 0.05, " mm");
+                    override_row(ui, "Tool diameter", &mut o.tool_diameter, job.tool_diameter, 0.05, " mm");
+                    let mut on_ms = o.on_delay_ms.map(|v| v as f64);
+                    override_row(ui, "Start delay", &mut on_ms, job.on_delay_ms as f64, 5.0, " ms");
+                    o.on_delay_ms = on_ms.map(|v| v.max(0.0) as u32);
+                    let mut off_ms = o.off_delay_ms.map(|v| v as f64);
+                    override_row(ui, "Stop delay", &mut off_ms, job.off_delay_ms as f64, 5.0, " ms");
+                    o.off_delay_ms = off_ms.map(|v| v.max(0.0) as u32);
+                });
+                if ui.add_enabled(!o.is_empty(), egui::Button::new("Use job settings")).clicked() {
+                    *o = Over3::default();
+                }
             });
-            ui.horizontal(|ui| {
-                ui.label("Offset side");
-                egui::ComboBox::from_id_salt("p3_side")
-                    .selected_text(step.side.label())
-                    .show_ui(ui, |ui| {
-                        for sd in Side::ALL {
-                            ui.selectable_value(&mut step.side, sd, sd.label());
-                        }
-                    });
-            });
-            ui.label(RichText::new(format!("Offset: {} mm (half the tool diameter)", job.tool_diameter / 2.0)).small().weak());
-            if ui.add_enabled(step.customised(), egui::Button::new("Use job settings")).clicked() {
-                step.gap = None;
-                step.feed = None;
-                step.side = Side::Outside;
+        }
+        Kind3::Goto { .. } => {
+            if let Kind3::Goto { x, y, z } = &mut s.kind {
+                egui::Grid::new(("p3_goto", i)).num_columns(2).show(ui, |ui| {
+                    for (l, v) in [("X", x), ("Y", y), ("Z", z)] {
+                        ui.label(l);
+                        ui.add(egui::DragValue::new(v).speed(0.1).suffix(" mm"));
+                        ui.end_row();
+                    }
+                });
+                // For reference: where the steps around this one are.
+                let at = |p: V3| format!("X {:.2}   Y {:.2}   Z {:.2}", p[0], p[1], p[2]);
+                if let Some(p) = around.0 {
+                    ui.label(RichText::new(format!("Previous step ends at  {}", at(p))).small().weak());
+                }
+                if let Some(p) = around.1 {
+                    ui.label(RichText::new(format!("Next step starts at  {}", at(p))).small().weak());
+                }
             }
         }
-        Kind3::Goto { x, y, z } => {
-            egui::Grid::new("p3_step_goto").num_columns(2).show(ui, |ui| {
-                for (l, v) in [("X", x), ("Y", y), ("Z", z)] {
-                    ui.label(l);
-                    ui.add(egui::DragValue::new(v).speed(0.1).suffix(" mm"));
-                    ui.end_row();
-                }
-            });
+        Kind3::Pause { .. } => {
+            if let Kind3::Pause { ms } = &mut s.kind {
+                ui.horizontal(|ui| {
+                    ui.label("Wait");
+                    ui.add(egui::DragValue::new(ms).speed(10.0).range(0..=600_000).suffix(" ms"));
+                });
+            }
         }
-        Kind3::Pause { ms } => {
-            ui.horizontal(|ui| {
-                ui.label("Wait");
-                ui.add(egui::DragValue::new(ms).speed(10.0).range(0..=600_000).suffix(" ms"));
-            });
-        }
-        Kind3::Home => {
-            ui.label("Goes to the home position of the machine.");
-        }
+        Kind3::Home => {}
     }
-    pick_surface
 }
 
 fn move_steps(project: &mut Project3, sel: &mut Vec<usize>, ins: usize) {
@@ -778,18 +1009,18 @@ fn move_steps(project: &mut Project3, sel: &mut Vec<usize>, ins: usize) {
         return;
     }
     let before = idx.iter().filter(|&&i| i < ins).count();
-    let items: Vec<Step3> = idx.iter().map(|&i| project.sequence[i]).collect();
+    let items: Vec<Step3> = idx.iter().map(|&i| project.sequence[i].clone()).collect();
     for &i in idx.iter().rev() {
         project.sequence.remove(i);
     }
     let at = (ins - before).min(project.sequence.len());
     for (k, it) in items.iter().enumerate() {
-        project.sequence.insert(at + k, *it);
+        project.sequence.insert(at + k, it.clone());
     }
     *sel = (at..at + items.len()).collect();
 }
 
-fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, drag: &mut Option<usize>, mode: &mut PickMode) {
+fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, drag: &mut Option<usize>, pick: &mut Pick, viz: &[StepViz]) {
     sel.retain(|&i| i < project.sequence.len());
     let mut add: Option<AddStep> = None;
     let mut delete = false;
@@ -802,6 +1033,10 @@ fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, 
             }
             let plus = icons::icon_button(ui, icons::Icon::Plus, "Add a step");
             egui::Popup::menu(&plus).show(|ui| {
+                if ui.button("Path").clicked() {
+                    add = Some(AddStep::Path);
+                }
+                ui.separator();
                 if ui.button("Home").clicked() {
                     add = Some(AddStep::Home);
                 }
@@ -818,20 +1053,18 @@ fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, 
             });
         });
     });
-    ui.label(
-        RichText::new("Click edges in the view to add paths. Drag rows to reorder. Ctrl or Shift click selects several.")
-            .small()
-            .weak(),
-    );
+    ui.label(RichText::new("Add a Path, then open its row and use Pick to choose the edge and surface. Drag rows to reorder.").small().weak());
 
     if !sel.is_empty() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
         delete = true;
     }
 
     if let Some(a) = add {
+        *pick = None;
         let at = sel.iter().max().map_or(project.sequence.len(), |m| m + 1).min(project.sequence.len());
         let home = project.machine.home_position();
         let new = match a {
+            AddStep::Path => Some(Step3::new(Kind3::Path)),
             AddStep::Home => Some(Step3::new(Kind3::Home)),
             AddStep::Goto => Some(Step3::new(Kind3::Goto { x: home[0], y: home[1], z: home[2] })),
             AddStep::Pause => Some(Step3::new(Kind3::Pause { ms: 1000 })),
@@ -847,6 +1080,7 @@ fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, 
         }
     }
     if delete {
+        *pick = None;
         let mut idx = sel.clone();
         idx.sort_unstable();
         idx.dedup();
@@ -860,87 +1094,89 @@ fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, 
 
     let n = project.sequence.len();
     let job = project.job.clone();
+    let names: Vec<String> = project.bodies.iter().map(|b| b.name.clone()).collect();
     let mut rows: Vec<egui::Rect> = Vec::with_capacity(n);
     if n == 0 {
         ui.label(RichText::new("The sequence is empty.").small().weak());
     }
     for i in 0..n {
-        let item = project.sequence[i];
+        let item = project.sequence[i].clone();
         let desc = step_desc(project, &item);
         let selected = sel.contains(&i);
         let bg = ui.painter().add(egui::Shape::Noop);
-        let mut label_rect = egui::Rect::NOTHING;
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - if item.is_edge() { 54.0 } else { 28.0 }).max(40.0);
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
-            label_rect = rect;
-            if resp.drag_started() {
-                *drag = Some(i);
-                if !selected {
-                    sel.clear();
-                    sel.push(i);
-                }
-            }
-            if resp.clicked() {
-                let m = ui.input(|inp| inp.modifiers);
-                if m.shift && !sel.is_empty() {
-                    let anchor = *sel.last().unwrap();
-                    *sel = (anchor.min(i)..=anchor.max(i)).collect();
-                } else if m.command {
-                    if let Some(pos) = sel.iter().position(|&x| x == i) {
-                        sel.remove(pos);
-                    } else {
-                        sel.push(i);
+        let block = ui
+            .vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if item.kind == Kind3::Home {
+                        ui.add_space(24.0);
+                    } else if ui.small_button(if item.open { "v" } else { ">" }).on_hover_text("Show or hide the options").clicked() {
+                        project.sequence[i].open = !item.open;
                     }
-                } else {
-                    sel.clear();
-                    sel.push(i);
+                    let w = (ui.available_width() - if item.is_path() { 26.0 } else { 0.0 }).max(40.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
+                    if resp.drag_started() {
+                        *drag = Some(i);
+                        if !selected {
+                            sel.clear();
+                            sel.push(i);
+                        }
+                    }
+                    if resp.clicked() {
+                        let m = ui.input(|inp| inp.modifiers);
+                        if m.shift && !sel.is_empty() {
+                            let anchor = *sel.last().unwrap();
+                            *sel = (anchor.min(i)..=anchor.max(i)).collect();
+                        } else if m.command {
+                            if let Some(pos) = sel.iter().position(|&x| x == i) {
+                                sel.remove(pos);
+                            } else {
+                                sel.push(i);
+                            }
+                        } else {
+                            sel.clear();
+                            sel.push(i);
+                        }
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(if drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+                    }
+                    let col = ui.visuals().text_color();
+                    let painter = ui.painter().with_clip_rect(rect);
+                    for dx in [0.0_f32, 4.0] {
+                        for dy in [-4.0_f32, 0.0, 4.0] {
+                            painter.circle_filled(rect.left_center() + egui::vec2(5.0 + dx, dy), 1.1, col.gamma_multiply(0.5));
+                        }
+                    }
+                    painter.text(
+                        rect.left_center() + egui::vec2(18.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:>2}.  {}", i + 1, desc),
+                        egui::FontId::proportional(13.0),
+                        col,
+                    );
+                    if item.is_path() {
+                        let rev = icons::icon_button_ex(ui, icons::Icon::Reverse, "Reverse direction", item.reverse, true);
+                        if rev.clicked() {
+                            project.sequence[i].reverse = !item.reverse;
+                        }
+                    }
+                });
+                if item.open && item.kind != Kind3::Home {
+                    // For a go to: where the neighbouring steps are, for reference.
+                    let before = (0..i).rev().find_map(|k| viz.get(k).and_then(|v| v.pts.last().copied()));
+                    let after = (i + 1..n).find_map(|k| viz.get(k).and_then(|v| v.pts.first().copied()));
+                    ui.indent(("p3_body", i), |ui| step_body(ui, i, &mut project.sequence[i], &job, &names, pick, (before, after)));
                 }
-            }
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(if drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
-            }
-            let col = ui.visuals().text_color();
-            let painter = ui.painter().with_clip_rect(rect);
-            for dx in [0.0_f32, 4.0] {
-                for dy in [-4.0_f32, 0.0, 4.0] {
-                    painter.circle_filled(rect.left_center() + egui::vec2(5.0 + dx, dy), 1.1, col.gamma_multiply(0.5));
-                }
-            }
-            painter.text(
-                rect.left_center() + egui::vec2(18.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                format!("{:>2}.  {}", i + 1, desc),
-                egui::FontId::proportional(13.0),
-                col,
-            );
-            if item.is_edge() {
-                let rev = icons::icon_button_ex(ui, icons::Icon::Reverse, "Reverse direction", item.reverse, true);
-                if rev.clicked() {
-                    project.sequence[i].reverse = !item.reverse;
-                }
-            }
-            if item.kind != Kind3::Home {
-                let b = icons::icon_button_ex(ui, icons::Icon::Settings, "Step settings", item.customised(), true);
-                let bodies = project.bodies.clone();
-                let mut want_surface = false;
-                egui::Popup::from_toggle_button_response(&b)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                        want_surface = step_settings(ui, &bodies, &mut project.sequence[i], &job, mode);
-                    });
-                if want_surface {
-                    *sel = vec![i];
-                }
-            }
-        });
+            })
+            .response
+            .rect;
         let full = egui::Rect::from_min_max(
-            egui::pos2(ui.min_rect().left(), label_rect.top() - 1.0),
-            egui::pos2(ui.max_rect().right(), label_rect.bottom() + 1.0),
+            egui::pos2(ui.min_rect().left(), block.top() - 1.0),
+            egui::pos2(ui.max_rect().right(), block.bottom() + 1.0),
         );
         rows.push(full);
         let fill = if selected {
-            Some(theme::ACCENT.gamma_multiply(0.7))
+            Some(theme::ACCENT.gamma_multiply(0.45))
         } else if i % 2 == 1 {
             Some(ui.visuals().faint_bg_color)
         } else {
@@ -963,6 +1199,7 @@ fn sequence_ui(ui: &mut egui::Ui, project: &mut Project3, sel: &mut Vec<usize>, 
                 );
             }
             if ui.input(|i| i.pointer.any_released()) {
+                *pick = None;
                 move_steps(project, sel, ins);
                 *drag = None;
             }

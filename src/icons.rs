@@ -13,6 +13,10 @@ pub enum Icon {
     Trash,
     Settings,
     Reverse,
+    SelEdge,
+    SelFace,
+    SelPoint,
+    Offset,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
@@ -35,9 +39,18 @@ pub fn icon_button_ex(ui: &mut Ui, icon: Icon, tip: &str, active: bool, enabled:
     } else {
         v.fg_stroke.color
     };
+    draw(ui.painter(), rect.center(), icon, color);
+    resp.on_hover_text(tip)
+}
+
+/// A non-clickable icon in the given colour.
+pub fn icon_label(ui: &mut Ui, icon: Icon, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+    draw(ui.painter(), rect.center(), icon, color);
+}
+
+fn draw(p: &egui::Painter, c: Pos2, icon: Icon, color: egui::Color32) {
     let stroke = Stroke::new(1.6, color);
-    let c = rect.center();
-    let p = ui.painter();
     match icon {
         Icon::Reload => {
             // Open circle with an arrow head at the end.
@@ -124,6 +137,33 @@ pub fn icon_button_ex(ui: &mut Ui, icon: Icon, tip: &str, active: bool, enabled:
             p.line_segment([c + Vec2::new(-6.0, y2), c + Vec2::new(-3.0, y2 - 2.5)], stroke);
             p.line_segment([c + Vec2::new(-6.0, y2), c + Vec2::new(-3.0, y2 + 2.5)], stroke);
         }
+        Icon::SelEdge => {
+            // Dashed diagonal with a dot at each end.
+            for k in 0..3 {
+                let a = c + Vec2::new(-6.0 + 4.5 * k as f32, 6.0 - 4.5 * k as f32);
+                p.line_segment([a, a + Vec2::new(2.5, -2.5)], stroke);
+            }
+            p.circle_filled(c + Vec2::new(-7.0, 7.0), 1.8, color);
+            p.circle_filled(c + Vec2::new(7.0, -7.0), 1.8, color);
+        }
+        Icon::SelFace => {
+            let pts = vec![c + Vec2::new(-7.0, 5.0), c + Vec2::new(-3.0, -5.0), c + Vec2::new(7.0, -5.0), c + Vec2::new(3.0, 5.0)];
+            p.add(Shape::convex_polygon(pts, color.gamma_multiply(0.25), stroke));
+        }
+        Icon::SelPoint => {
+            p.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(6.0, 0.0)], stroke);
+            p.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, 6.0)], stroke);
+            p.circle_filled(c, 2.2, color);
+        }
+        Icon::Offset => {
+            // Two lines with a double arrow between them.
+            p.line_segment([c + Vec2::new(-7.0, -6.0), c + Vec2::new(-7.0, 6.0)], stroke);
+            p.line_segment([c + Vec2::new(5.0, -6.0), c + Vec2::new(5.0, 6.0)], stroke);
+            p.line_segment([c + Vec2::new(-7.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
+            for (e, dx) in [(-7.0_f32, 3.0_f32), (5.0, -3.0)] {
+                p.line_segment([c + Vec2::new(e, 0.0), c + Vec2::new(e + dx, -2.5)], stroke);
+                p.line_segment([c + Vec2::new(e, 0.0), c + Vec2::new(e + dx, 2.5)], stroke);
+            }
+        }
     }
-    resp.on_hover_text(tip)
 }

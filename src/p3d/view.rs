@@ -93,11 +93,19 @@ pub enum PickMode {
     Surface,
     /// Prepare: click a flat face to lay it on the bed.
     LayFace,
+    /// Path selection: click a spot on a surface.
+    Point,
+    /// A start or stop: click an edge or a surface, Ctrl+click a point on it.
+    Any,
+    /// Path selection with nothing to pick: clicks do nothing.
+    Idle,
 }
 
 /// One sequence step as drawn in the view.
 pub struct StepViz {
     pub pts: Vec<V3>,
+    /// The lead in, drawn apart from the path.
+    pub lead: Vec<V3>,
     pub is_path: bool,
 }
 
@@ -118,6 +126,7 @@ pub struct ViewOut {
     pub body_click: Option<Option<usize>>,
     pub edge_click: Option<(usize, usize)>,
     pub face_click: Option<(usize, usize)>,
+    pub point_click: Option<V3>,
     /// Cursor on the bed plane.
     pub cursor: Option<[f64; 2]>,
 }
@@ -216,6 +225,24 @@ impl View3 {
         raster::unpack_id(fr.id[y as usize * fr.w + x as usize])
     }
 
+    /// The point on the visible surface under the cursor, from the depth buffer.
+    fn point_at(&self, pr: &Proj, rect: Rect, pos: Pos2) -> Option<V3> {
+        let fr = self.frame.as_ref()?;
+        let x = ((pos.x - rect.min.x) * self.scale) as i64;
+        let y = ((pos.y - rect.min.y) * self.scale) as i64;
+        if x < 0 || y < 0 || x as usize >= fr.w || y as usize >= fr.h {
+            return None;
+        }
+        let iz = fr.inv_z[y as usize * fr.w + x as usize];
+        if iz <= 0.0 {
+            return None;
+        }
+        // The buffer holds depth along the view direction.
+        let (o, d) = pr.ray(pos);
+        let t = (1.0 / iz as f64) / dot(d, pr.f);
+        Some([o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t])
+    }
+
     /// Visible edge near the cursor.
     fn edge_at(&self, project: &Project3, pr: &Proj, rect: Rect, pos: Pos2) -> Option<(usize, usize)> {
         let fr = self.frame.as_ref()?;
@@ -263,7 +290,8 @@ impl View3 {
         let mut pr = self.proj(rect);
         let hover = resp.hover_pos();
         let face_hover = hover.and_then(|p| self.face_at(rect, p));
-        let edge_hover = if ov.mode == PickMode::Edges {
+        let ctrl = ui.input(|i| i.modifiers.command);
+        let edge_hover = if matches!(ov.mode, PickMode::Edges | PickMode::Any) {
             hover.and_then(|p| self.edge_at(project, &pr, rect, p))
         } else {
             None
@@ -317,6 +345,17 @@ impl View3 {
                 PickMode::Move => out.body_click = Some(face_hover.map(|f| f.0)),
                 PickMode::Edges => out.edge_click = edge_hover,
                 PickMode::Surface | PickMode::LayFace => out.face_click = face_hover,
+                PickMode::Point => out.point_click = hover.and_then(|p| self.point_at(&pr, rect, p)),
+                PickMode::Any => {
+                    if edge_hover.is_some() {
+                        out.edge_click = edge_hover;
+                    } else if ctrl {
+                        out.point_click = hover.and_then(|p| self.point_at(&pr, rect, p));
+                    } else {
+                        out.face_click = face_hover;
+                    }
+                }
+                PickMode::Idle => {}
             }
         }
         if resp.hovered() {
@@ -386,7 +425,8 @@ impl View3 {
             scale *= 0.9;
         }
         let (wpx, hpx) = (((rect.width() * scale) as usize).max(1), ((rect.height() * scale) as usize).max(1));
-        let hover_tint = if matches!(ov.mode, PickMode::Surface | PickMode::LayFace) { face_hover } else { None };
+        let any_face = ov.mode == PickMode::Any && edge_hover.is_none() && !ctrl;
+        let hover_tint = if matches!(ov.mode, PickMode::Surface | PickMode::LayFace) || any_face { face_hover } else { None };
 
         let mut h = DefaultHasher::new();
         (wpx, hpx).hash(&mut h);
@@ -456,6 +496,11 @@ impl View3 {
             Color32::from_rgb(0x4a, 0x55, 0x61),
         );
 
+        if ov.mode == PickMode::Point || (ov.mode == PickMode::Any && ctrl && edge_hover.is_none()) {
+            if let Some(s) = hover.and_then(|p| self.point_at(&pr, rect, p)).and_then(|w| pr.screen(w)) {
+                painter.circle_stroke(s.0, 6.0, Stroke::new(2.0, Color32::from_rgb(0xff, 0xb0, 0x00)));
+            }
+        }
         // Hovered edge.
         if let Some((b, e)) = edge_hover {
             let pts: Vec<Pos2> = project.edge_points(b, e).iter().filter_map(|p| pr.screen(*p)).map(|s| s.0).collect();
@@ -477,6 +522,10 @@ impl View3 {
                     painter.extend(Shape::dashed_line(&[pe, sp[0]], Stroke::new(1.0, Color32::from_rgb(0x55, 0x60, 0x6c)), 5.0, 4.0));
                 }
                 prev = sp.last().copied();
+                if viz.lead.len() >= 2 {
+                    let lp: Vec<Pos2> = viz.lead.iter().filter_map(|p| pr.screen(*p)).map(|s| s.0).collect();
+                    painter.add(Shape::line(lp, Stroke::new(2.0, Color32::from_rgb(0x3b, 0x82, 0xd6))));
+                }
                 if viz.is_path {
                     painter.add(Shape::line(sp.clone(), Stroke::new(if picked { 3.5 } else { 2.5 }, col)));
                     painter.circle_filled(sp[0], 9.0, col);

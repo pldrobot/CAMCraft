@@ -10,7 +10,6 @@ use std::sync::Arc;
 pub struct Job3 {
     pub dispense_feed: f64,
     pub travel_feed: f64,
-    pub safe_z: f64,
     /// Default distance between the tool tip and the chosen surface.
     pub z_gap: f64,
     /// Diameter of the tool. Paths are moved sideways by the radius, to the
@@ -27,7 +26,6 @@ impl Default for Job3 {
         Self {
             dispense_feed: 300.0,
             travel_feed: 3000.0,
-            safe_z: 30.0,
             z_gap: 1.0,
             tool_diameter: 0.0,
             on_delay_ms: 200,
@@ -37,72 +35,137 @@ impl Default for Job3 {
     }
 }
 
+impl Job3 {
+    /// The job settings with a step's overrides applied.
+    pub fn with(&self, o: &Over3) -> Job3 {
+        Job3 {
+            dispense_feed: o.feed.unwrap_or(self.dispense_feed),
+            travel_feed: o.travel_feed.unwrap_or(self.travel_feed),
+            z_gap: o.z_gap.unwrap_or(self.z_gap),
+            tool_diameter: o.tool_diameter.unwrap_or(self.tool_diameter),
+            on_delay_ms: o.on_delay_ms.unwrap_or(self.on_delay_ms),
+            off_delay_ms: o.off_delay_ms.unwrap_or(self.off_delay_ms),
+            sample_mm: self.sample_mm,
+        }
+    }
+}
+
+/// Per-step values that replace the job settings. None keeps the job value.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Over3 {
+    pub feed: Option<f64>,
+    pub travel_feed: Option<f64>,
+    pub z_gap: Option<f64>,
+    pub tool_diameter: Option<f64>,
+    pub on_delay_ms: Option<u32>,
+    pub off_delay_ms: Option<u32>,
+}
+
+impl Over3 {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Kind3 {
-    /// Follow an edge of a body.
-    Edge { body: usize, edge: usize },
+    /// Follow an edge of a part. The edge is picked after the step is added.
+    Path,
     Home,
     Goto { x: f64, y: f64, z: f64 },
     Pause { ms: u32 },
 }
 
-/// Which side of the edge the tool centre runs on.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Side {
-    /// Away from the chosen surface (the tool stays off the part).
-    #[default]
-    Outside,
-    /// Onto the chosen surface.
-    Inside,
-    /// Left of the travel direction, seen from above.
-    Left,
-    Right,
-    /// On the edge itself.
-    None,
-}
-
-impl Side {
-    pub const ALL: [Side; 5] = [Side::Outside, Side::Inside, Side::Left, Side::Right, Side::None];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Side::Outside => "Outside the surface",
-            Side::Inside => "Inside the surface",
-            Side::Left => "Left of the path",
-            Side::Right => "Right of the path",
-            Side::None => "On the edge",
-        }
-    }
-}
-
+/// Where a path starts or stops: a point, or where it comes closest to an edge
+/// or reaches a surface.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum Limit {
+    Point(V3),
+    Edge(usize, usize),
+    /// Where the path first reaches the surface (part, face).
+    Surface(usize, usize),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Step3 {
     pub kind: Kind3,
     pub reverse: bool,
-    /// Surface (body, face) the Z gap is measured from. None follows the edge.
+    /// Edge (part, edge) to follow.
+    #[serde(default)]
+    pub path: Option<(usize, usize)>,
+    /// Surface (part, face) the Z gap is measured from. None follows the edge.
     #[serde(default)]
     pub surface: Option<(usize, usize)>,
-    /// Z gap of this step; None uses the job value.
+    /// Optional start and stop, along the travel direction.
     #[serde(default)]
-    pub gap: Option<f64>,
+    pub start: Option<Limit>,
     #[serde(default)]
-    pub feed: Option<f64>,
-    /// Side of the edge for the tool diameter offset.
+    pub stop: Option<Limit>,
+    /// Distance from the start / stop element, along the path. None is the
+    /// tool offset (half the tool diameter). Inward shortens the path from
+    /// that end; the flag turns it outward, which lengthens it.
     #[serde(default)]
-    pub side: Side,
+    pub start_offset: Option<f64>,
+    #[serde(default)]
+    pub start_flip: bool,
+    #[serde(default)]
+    pub stop_offset: Option<f64>,
+    #[serde(default)]
+    pub stop_flip: bool,
+    /// Distance of the path from the edge, away from the surface (the middle
+    /// of the part when there is none). None is the tool offset. The flag
+    /// turns it toward the surface.
+    #[serde(default)]
+    pub offset: Option<f64>,
+    #[serde(default)]
+    pub offset_flip: bool,
+    /// Lead in: the way from the end of the previous step to the start of this
+    /// path, following `lead_surfaces` where it passes over them.
+    #[serde(default)]
+    pub lead_in: bool,
+    #[serde(default)]
+    pub lead_surfaces: Vec<(usize, usize)>,
+    /// How far the lead in keeps from those surfaces. None is the tool offset
+    /// (half the tool diameter).
+    #[serde(default)]
+    pub lead_offset: Option<f64>,
+    /// Keep to the other side of those surfaces than the lead in is on.
+    #[serde(default)]
+    pub lead_flip: bool,
+    #[serde(default)]
+    pub over: Over3,
+    /// Row expanded in the list. New steps start expanded; opened projects collapsed.
+    #[serde(skip)]
+    pub open: bool,
 }
 
 impl Step3 {
     pub fn new(kind: Kind3) -> Self {
-        Self { kind, reverse: false, surface: None, gap: None, feed: None, side: Side::Outside }
+        Self {
+            kind,
+            reverse: false,
+            path: None,
+            surface: None,
+            start: None,
+            stop: None,
+            start_offset: None,
+            start_flip: false,
+            stop_offset: None,
+            stop_flip: false,
+            offset: None,
+            offset_flip: false,
+            lead_in: true,
+            lead_surfaces: vec![],
+            lead_offset: None,
+            lead_flip: false,
+            over: Over3::default(),
+            open: true,
+        }
     }
 
-    pub fn is_edge(&self) -> bool {
-        matches!(self.kind, Kind3::Edge { .. })
-    }
-
-    pub fn customised(&self) -> bool {
-        self.gap.is_some() || self.feed.is_some() || self.side != Side::Outside
+    pub fn is_path(&self) -> bool {
+        self.kind == Kind3::Path
     }
 }
 
@@ -230,10 +293,6 @@ impl Body {
         self.bounds().0
     }
 
-    pub fn max_corner(&self) -> V3 {
-        self.bounds().1
-    }
-
     /// Apply a rotation about the middle of the part. The part stays where it
     /// is in X and Y. It is put back on the bed (lowest point at Z 0), except
     /// for a turn about Z, which keeps its height.
@@ -308,28 +367,30 @@ impl Project3 {
             return;
         }
         self.bodies.remove(idx);
-        self.sequence.retain(|s| match s.kind {
-            Kind3::Edge { body, .. } => body != idx,
-            _ => true,
-        });
+        // Steps keep their place; what pointed at the removed part is cleared.
+        let shift = |r: &mut Option<(usize, usize)>| {
+            if let Some((b, f)) = *r {
+                *r = if b == idx { None } else if b > idx { Some((b - 1, f)) } else { *r };
+            }
+        };
         for s in &mut self.sequence {
-            if let Kind3::Edge { body, .. } = &mut s.kind {
-                if *body > idx {
-                    *body -= 1;
+            shift(&mut s.path);
+            shift(&mut s.surface);
+            s.lead_surfaces.retain(|f| f.0 != idx);
+            for f in &mut s.lead_surfaces {
+                if f.0 > idx {
+                    f.0 -= 1;
                 }
             }
-            if let Some(sf) = &mut s.surface {
-                if sf.0 == idx {
-                    s.surface = None;
-                } else if sf.0 > idx {
-                    sf.0 -= 1;
-                }
+            for l in [&mut s.start, &mut s.stop] {
+                *l = match *l {
+                    Some(Limit::Edge(b, _) | Limit::Surface(b, _)) if b == idx => None,
+                    Some(Limit::Edge(b, e)) if b > idx => Some(Limit::Edge(b - 1, e)),
+                    Some(Limit::Surface(b, f)) if b > idx => Some(Limit::Surface(b - 1, f)),
+                    other => other,
+                };
             }
         }
-    }
-
-    pub fn edge_in_sequence(&self, body: usize, edge: usize) -> Option<usize> {
-        self.sequence.iter().position(|s| s.kind == Kind3::Edge { body, edge })
     }
 
     /// Edge of a body in bed coordinates.
@@ -339,30 +400,132 @@ impl Project3 {
         g.edges.get(edge).map(|e| e.pts.iter().map(|p| b.world(*p)).collect()).unwrap_or_default()
     }
 
-    /// The face next to an edge that faces up the most. The default surface
-    /// of a new edge step.
-    pub fn default_surface(&self, body: usize, edge: usize) -> Option<(usize, usize)> {
-        let g = self.bodies.get(body)?.geo.as_ref()?;
-        let e = g.edges.get(edge)?;
-        e.faces
+    /// Where a step leaves the tool: the end of a path, the point of a go to,
+    /// home. None for a pause or a path without points.
+    fn end_point(&self, step: &Step3) -> Option<V3> {
+        match step.kind {
+            Kind3::Path => self.step_points(step).last().copied(),
+            Kind3::Home => Some(self.machine.home_position()),
+            Kind3::Goto { x, y, z } => Some([x, y, z]),
+            Kind3::Pause { .. } => None,
+        }
+    }
+
+    /// The lead in of step `i`: from the end of the step before it to the start
+    /// of its path, both included. It runs straight between the two, but is
+    /// pushed away from the surfaces picked in the step so it stays at least the
+    /// lead in offset from them, on the side it is on. That keeps it off walls
+    /// as well as floors. When the straight way goes through one of those
+    /// surfaces (a post, a wall), it goes around the whole piece instead, to the
+    /// left of its travel direction, or the right when the direction is flipped.
+    /// Empty when there is no lead in.
+    pub fn lead_in_points(&self, i: usize) -> Vec<V3> {
+        let Some(step) = self.sequence.get(i) else { return vec![] };
+        if i == 0 || !step.is_path() || !step.lead_in {
+            return vec![];
+        }
+        let (Some(from), Some(&to)) = (self.end_point(&self.sequence[i - 1]), self.step_points(step).first()) else {
+            return vec![];
+        };
+        let job = self.job.with(&step.over);
+        let faces: Vec<Vec<[V3; 3]>> = step
+            .lead_surfaces
             .iter()
-            .copied()
-            .max_by(|a, b| g.face_normal(*a)[2].total_cmp(&g.face_normal(*b)[2]))
-            .map(|f| (body, f))
+            .filter_map(|&(b, f)| {
+                let body = self.bodies.get(b)?;
+                let face = body.geo.as_ref()?.faces.get(f)?;
+                Some(face.tris.iter().map(|t| t.map(|p| body.world(p))).collect())
+            })
+            .collect();
+        let off = step.lead_offset.unwrap_or(job.tool_diameter.max(0.0) / 2.0);
+        let len = (0..3).map(|k| (to[k] - from[k]).powi(2)).sum::<f64>().sqrt();
+        // Pieces short enough to follow a wall closely.
+        let mut piece = job.sample_mm.max(0.05);
+        if !faces.is_empty() && off > 0.0 {
+            piece = piece.min((off / 2.0).max(0.05));
+        }
+        let n = (len / piece).ceil().max(1.0) as usize;
+        let mut out: Vec<V3> = (0..=n)
+            .map(|k| if k == 0 { from } else if k == n { to } else { lerp(from, to, k as f64 / n as f64) })
+            .collect();
+        if off > 0.0 && bypass(&faces, &mut out, off, if step.lead_flip { -1.0 } else { 1.0 }) {
+            return out;
+        }
+        for k in 1..n {
+            if off > 0.0 {
+                out[k] = keep_out(&faces, out[k], off, step.lead_flip);
+            }
+        }
+        // Smooth the moved points a little and push them out again, so a wall
+        // that is followed does not make the curve zig-zag.
+        if !faces.is_empty() && off > 0.0 {
+            for _ in 0..4 {
+                let prev = out.clone();
+                for k in 1..out.len() - 1 {
+                    let mut p = [0.0; 3];
+                    for a in 0..3 {
+                        p[a] = 0.25 * prev[k - 1][a] + 0.5 * prev[k][a] + 0.25 * prev[k + 1][a];
+                    }
+                    // The side is settled by now: keep to wherever each point is.
+                    out[k] = keep_out(&faces, p, off, false);
+                }
+            }
+        }
+        out
     }
 
-    pub fn new_edge_step(&self, body: usize, edge: usize) -> Step3 {
-        let mut s = Step3::new(Kind3::Edge { body, edge });
-        s.surface = self.default_surface(body, edge);
-        s
+    /// Where along `pts` a start or stop limit is: segment and position on it.
+    fn limit_hit(&self, pts: &[V3], l: Limit) -> Option<(usize, f64)> {
+        match l {
+            Limit::Point(p) => nearest_on(pts, &[p]),
+            Limit::Edge(b, e) => nearest_on(pts, &resample(&self.edge_points(b, e), 1.0)),
+            Limit::Surface(b, f) => {
+                let body = self.bodies.get(b)?;
+                let face = body.geo.as_ref()?.faces.get(f)?;
+                let tris: Vec<[V3; 3]> = face.tris.iter().map(|t| t.map(|p| body.world(p))).collect();
+                nearest_on_surface(pts, &tris)
+            }
+        }
     }
 
-    /// Tool tip points of an edge step in bed coordinates, in travel order.
-    /// Follows the surface with the Z gap and the tool compensation.
+    /// The path of a step in bed coordinates, in travel order: the edge cut
+    /// to its start and stop, Z from the surface plus the Z gap, moved
+    /// sideways by the path offset and the tool radius.
     pub fn step_points(&self, step: &Step3) -> Vec<V3> {
-        let Kind3::Edge { body, edge } = step.kind else { return vec![] };
+        let Some((body, edge)) = step.path else { return vec![] };
+        let job = self.job.with(&step.over);
         let mut pts = self.edge_points(body, edge);
-        let gap = step.gap.unwrap_or(self.job.z_gap);
+        let hit = |pts: &[V3], l: Option<Limit>| l.and_then(|l| self.limit_hit(pts, l));
+        let pos = |h: Option<(usize, f64)>| h.map(|(i, t)| i as f64 + t);
+        // With both a start and a stop the path runs from the start toward the
+        // stop, whatever the direction of the edge. Otherwise Reverse decides.
+        let reverse = match (pos(hit(&pts, step.start)), pos(hit(&pts, step.stop))) {
+            (Some(a), Some(b)) => a > b,
+            _ => step.reverse,
+        };
+        if reverse {
+            pts.reverse();
+        }
+        // Positions of the start and the stop along the path (in mm from its
+        // first point), moved by their offsets.
+        // Everything sideways defaults to the tool offset.
+        let r = job.tool_diameter.max(0.0) / 2.0;
+        let cum = cumulative(&pts);
+        let total = cum.last().copied().unwrap_or(0.0);
+        let along = |l: Option<Limit>, off: f64, flip: bool, inward: f64| {
+            let (i, t) = l.and_then(|l| self.limit_hit(&pts, l))?;
+            let s = cum[i] + t * (cum[i + 1] - cum[i]) + inward * off * if flip { -1.0 } else { 1.0 };
+            Some(s.clamp(0.0, total))
+        };
+        let s0 = along(step.start, step.start_offset.unwrap_or(r), step.start_flip, 1.0).unwrap_or(0.0);
+        let s1 = along(step.stop, step.stop_offset.unwrap_or(r), step.stop_flip, -1.0).unwrap_or(total);
+        if s0 > 0.0 || s1 < total {
+            pts = cut_range(&pts, &cum, s0, s1);
+        }
+        pts.dedup_by(|a, b| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() < 1e-9);
+        if pts.len() < 2 {
+            return vec![];
+        }
         // The face in bed coordinates.
         let tris: Option<Vec<[V3; 3]>> = step.surface.and_then(|(sb, sf)| {
             let b = self.bodies.get(sb)?;
@@ -371,48 +534,44 @@ impl Project3 {
         });
         if let Some(tris) = &tris {
             // Z follows the surface, measured on the edge itself.
-            pts = resample(&pts, self.job.sample_mm.max(0.05));
+            pts = resample(&pts, job.sample_mm.max(0.05));
             for p in &mut pts {
                 p[2] = surface_at(tris, [p[0], p[1]]).map_or(p[2], |s| s.0);
             }
         }
         for p in &mut pts {
-            p[2] += gap;
+            p[2] += job.z_gap;
         }
-        // Tool diameter: move the path sideways by the radius.
-        let r = self.job.tool_diameter.max(0.0) / 2.0;
-        if r > 0.0 && step.side != Side::None {
-            // Which way is "outside": away from the middle of the surface, or
-            // from the middle of the part when there is no surface.
-            let centre = match &tris {
-                Some(t) if !t.is_empty() => {
-                    let n = t.len() as f64 * 3.0;
-                    let (mut x, mut y) = (0.0, 0.0);
-                    for tri in t {
-                        for v in tri {
-                            x += v[0];
-                            y += v[1];
-                        }
+        // "Away" is away from the middle of the surface, or from the middle of
+        // the part when there is no surface.
+        let centre = match &tris {
+            Some(t) if !t.is_empty() => {
+                let n = t.len() as f64 * 3.0;
+                let (mut x, mut y) = (0.0, 0.0);
+                for tri in t {
+                    for v in tri {
+                        x += v[0];
+                        y += v[1];
                     }
-                    [x / n, y / n]
                 }
-                _ => {
-                    let (lo, hi) = self.bodies.get(body).map_or(([0.0; 3], [0.0; 3]), |b| b.bounds());
-                    [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
-                }
-            };
-            offset_polyline(&mut pts, r, step.side, centre);
-        }
-        if step.reverse {
-            pts.reverse();
+                [x / n, y / n]
+            }
+            _ => {
+                let (lo, hi) = self.bodies.get(body).map_or(([0.0; 3], [0.0; 3]), |b| b.bounds());
+                [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
+            }
+        };
+        let off = step.offset.unwrap_or(r);
+        if off > 0.0 {
+            offset_polyline(&mut pts, off, step.offset_flip, centre);
         }
         pts
     }
 }
 
-/// Move a polyline sideways (in X and Y) by `dist`. `side` says which side;
-/// Outside and Inside are decided against `centre`. Corners are mitred.
-pub fn offset_polyline(pts: &mut [V3], dist: f64, side: Side, centre: [f64; 2]) {
+/// Move a polyline sideways (in X and Y) by `dist`, away from `centre`, or
+/// toward it when `flip` is set. Corners are mitred.
+pub fn offset_polyline(pts: &mut [V3], dist: f64, flip: bool, centre: [f64; 2]) {
     let n = pts.len();
     if n < 2 {
         return;
@@ -429,25 +588,17 @@ pub fn offset_polyline(pts: &mut [V3], dist: f64, side: Side, centre: [f64; 2]) 
             if l < 1e-12 { [0.0, 0.0] } else { [-dy / l, dx / l] }
         })
         .collect();
-    let sign = match side {
-        Side::Left => 1.0,
-        Side::Right => -1.0,
-        Side::Outside | Side::Inside => {
-            // Test on the longest segment, away from corners.
-            let k = (0..n - 1)
-                .max_by(|&a, &b| {
-                    let la = (pts[a + 1][0] - pts[a][0]).hypot(pts[a + 1][1] - pts[a][1]);
-                    let lb = (pts[b + 1][0] - pts[b][0]).hypot(pts[b + 1][1] - pts[b][1]);
-                    la.total_cmp(&lb)
-                })
-                .unwrap_or(0);
-            let mid = [(pts[k][0] + pts[k + 1][0]) / 2.0, (pts[k][1] + pts[k + 1][1]) / 2.0];
-            let away = (mid[0] - centre[0]) * seg[k][0] + (mid[1] - centre[1]) * seg[k][1];
-            let out = if away >= 0.0 { 1.0 } else { -1.0 };
-            if side == Side::Outside { out } else { -out }
-        }
-        Side::None => return,
-    };
+    // Test on the longest segment, away from corners.
+    let k = (0..n - 1)
+        .max_by(|&a, &b| {
+            let la = (pts[a + 1][0] - pts[a][0]).hypot(pts[a + 1][1] - pts[a][1]);
+            let lb = (pts[b + 1][0] - pts[b][0]).hypot(pts[b + 1][1] - pts[b][1]);
+            la.total_cmp(&lb)
+        })
+        .unwrap_or(0);
+    let mid = [(pts[k][0] + pts[k + 1][0]) / 2.0, (pts[k][1] + pts[k + 1][1]) / 2.0];
+    let away = (mid[0] - centre[0]) * seg[k][0] + (mid[1] - centre[1]) * seg[k][1];
+    let sign = if (away >= 0.0) != flip { 1.0 } else { -1.0 };
     let orig: Vec<V3> = pts.to_vec();
     for i in 0..n {
         let prev = if i > 0 { Some(seg[i - 1]) } else if closed { Some(seg[n - 2]) } else { None };
@@ -471,6 +622,320 @@ pub fn offset_polyline(pts: &mut [V3], dist: f64, side: Side, centre: [f64; 2]) 
         pts[i][0] = orig[i][0] + sign * dist * nrm[0];
         pts[i][1] = orig[i][1] + sign * dist * nrm[1];
     }
+}
+
+/// The point of the triangle closest to `p`.
+fn closest_on_tri(p: V3, t: &[V3; 3]) -> V3 {
+    let sub = |a: V3, b: V3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let at = |o: V3, u: V3, k: f64| [o[0] + u[0] * k, o[1] + u[1] * k, o[2] + u[2] * k];
+    let (a, b, c) = (t[0], t[1], t[2]);
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = sub(p, b);
+    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return at(a, ab, d1 / (d1 - d3));
+    }
+    let cp = sub(p, c);
+    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return at(a, ac, d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return at(b, sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let den = 1.0 / (va + vb + vc);
+    at(at(a, ab, vb * den), ac, vc * den)
+}
+
+fn point_tri_dist2(p: V3, t: &[V3; 3]) -> f64 {
+    let q = closest_on_tri(p, t);
+    (0..3).map(|k| (p[k] - q[k]).powi(2)).sum()
+}
+
+/// Does the segment a-b pass through the triangle?
+fn segment_hits(a: V3, b: V3, t: &[V3; 3]) -> bool {
+    let sub = |a: V3, b: V3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = |a: V3, b: V3| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let dir = sub(b, a);
+    let (e1, e2) = (sub(t[1], t[0]), sub(t[2], t[0]));
+    let h = cross(dir, e2);
+    let det = dot(e1, h);
+    if det.abs() < 1e-14 {
+        return false;
+    }
+    let f = 1.0 / det;
+    let s = sub(a, t[0]);
+    let u = f * dot(s, h);
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let q = cross(s, e1);
+    let v = f * dot(dir, q);
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    (1e-9..=1.0 - 1e-9).contains(&(f * dot(e2, q)))
+}
+
+/// The triangles joined (sharing a corner) to any of the `start` triangles.
+fn joined_to(tris: &[[V3; 3]], start: &[usize]) -> Vec<usize> {
+    let key = |v: V3| ((v[0] * 1e4).round() as i64, (v[1] * 1e4).round() as i64, (v[2] * 1e4).round() as i64);
+    fn find(p: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            p[r] = p[p[r]];
+            r = p[r];
+        }
+        r
+    }
+    let mut parent: Vec<usize> = (0..tris.len()).collect();
+    let mut seen: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    for (i, t) in tris.iter().enumerate() {
+        for v in t {
+            if let Some(&j) = seen.get(&key(*v)) {
+                let (a, b) = (find(&mut parent, j), find(&mut parent, i));
+                parent[a] = b;
+            } else {
+                seen.insert(key(*v), i);
+            }
+        }
+    }
+    let roots: std::collections::HashSet<usize> = start.iter().map(|&i| find(&mut parent, i)).collect();
+    (0..tris.len()).filter(|&i| roots.contains(&find(&mut parent, i))).collect()
+}
+
+/// Outline of the points in X and Y, counter-clockwise. Two points for a line.
+fn convex_hull(mut p: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    p.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9);
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let chain = |pts: &mut dyn Iterator<Item = [f64; 2]>| {
+        let mut h: Vec<[f64; 2]> = vec![];
+        for q in pts {
+            while h.len() >= 2 && cross(h[h.len() - 2], h[h.len() - 1], q) <= 0.0 {
+                h.pop();
+            }
+            h.push(q);
+        }
+        h.pop();
+        h
+    };
+    let mut lower = chain(&mut p.iter().copied());
+    lower.extend(chain(&mut p.iter().rev().copied()));
+    lower
+}
+
+/// Distance from a point to the outline and what it encloses (0 inside).
+fn dist_to_hull(h: &[[f64; 2]], q: [f64; 2]) -> f64 {
+    let seg = |a: [f64; 2], b: [f64; 2]| {
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        let t = if l2 < 1e-18 { 0.0 } else { (((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
+        (a[0] + ab[0] * t - q[0]).hypot(a[1] + ab[1] * t - q[1])
+    };
+    match h.len() {
+        0 => f64::MAX,
+        1 => (h[0][0] - q[0]).hypot(h[0][1] - q[1]),
+        2 => seg(h[0], h[1]),
+        n => {
+            let side = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]);
+            if (0..n).all(|i| side(h[i], h[(i + 1) % n]) >= 0.0) {
+                0.0
+            } else {
+                (0..n).map(|i| seg(h[i], h[(i + 1) % n])).fold(f64::MAX, f64::min)
+            }
+        }
+    }
+}
+
+/// Bend a straight lead in around what is in its way. When it passes through
+/// one of the triangles, the whole piece those belong to (all triangles joined
+/// to them) is an obstacle, taken by its outline seen from above and its
+/// height. Each point at that height is moved sideways (left of the travel
+/// direction in X and Y, or right when `side` is -1) just far enough to be
+/// `off` from the outline. The shifts then fade away along the lead at 45
+/// degrees, so it makes a smooth detour. The two ends stay. Returns false, and
+/// changes nothing, when the lead in does not pass through anything.
+fn bypass(faces: &[Vec<[V3; 3]>], pts: &mut [V3], off: f64, side: f64) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+    let tris: Vec<[V3; 3]> = faces.iter().flatten().copied().collect();
+    let hit: Vec<usize> = (0..tris.len()).filter(|&i| segment_hits(pts[0], pts[n - 1], &tris[i])).collect();
+    if hit.is_empty() {
+        return false;
+    }
+    let (mut xy, mut zlo, mut zhi) = (vec![], f64::MAX, f64::MIN);
+    for i in joined_to(&tris, &hit) {
+        for v in &tris[i] {
+            xy.push([v[0], v[1]]);
+            zlo = zlo.min(v[2]);
+            zhi = zhi.max(v[2]);
+        }
+    }
+    let hull = convex_hull(xy);
+    let (dx, dy) = (pts[n - 1][0] - pts[0][0], pts[n - 1][1] - pts[0][1]);
+    let l = dx.hypot(dy);
+    if l < 1e-9 {
+        return false;
+    }
+    let lat = [-dy / l * side, dx / l * side];
+    let mut shift = vec![0.0_f64; n];
+    for i in 1..n - 1 {
+        if pts[i][2] < zlo - off || pts[i][2] > zhi + off {
+            continue; // over or under it
+        }
+        let mut k = 0.0;
+        while k <= 60.0 {
+            if dist_to_hull(&hull, [pts[i][0] + lat[0] * k, pts[i][1] + lat[1] * k]) >= off - 1e-9 {
+                shift[i] = k;
+                break;
+            }
+            k += 0.02;
+        }
+    }
+    let run = |a: V3, b: V3| (a[0] - b[0]).hypot(a[1] - b[1]);
+    for i in 1..n {
+        shift[i] = shift[i].max(shift[i - 1] - run(pts[i], pts[i - 1]));
+    }
+    for i in (0..n - 1).rev() {
+        shift[i] = shift[i].max(shift[i + 1] - run(pts[i], pts[i + 1]));
+    }
+    for i in 1..n - 1 {
+        pts[i][0] += lat[0] * shift[i];
+        pts[i][1] += lat[1] * shift[i];
+    }
+    true
+}
+
+/// Move `p` away from the surfaces until it is `off` from all of them, along the
+/// line from the closest surface point, so it stays on the side it is on. With
+/// `flip` it goes to the other side of the surface instead.
+/// shortcut: a point is only moved, a segment between two points is not checked,
+/// and a path that crosses a surface stays on both sides of it.
+fn keep_out(faces: &[Vec<[V3; 3]>], mut p: V3, off: f64, flip: bool) -> V3 {
+    for _ in 0..3 {
+        let mut best: Option<(f64, V3, V3)> = None; // distance squared, closest point, triangle normal
+        for t in faces.iter().flatten() {
+            let q = closest_on_tri(p, t);
+            let d2: f64 = (0..3).map(|k| (p[k] - q[k]).powi(2)).sum();
+            if best.is_none_or(|b| d2 < b.0) {
+                best = Some((d2, q, step::tri_normal(t)));
+            }
+        }
+        let Some((d2, q, n)) = best else { return p };
+        let dist = d2.sqrt();
+        if dist >= off - 1e-9 {
+            return p;
+        }
+        let dir = if dist > 1e-9 {
+            [(p[0] - q[0]) / dist, (p[1] - q[1]) / dist, (p[2] - q[2]) / dist]
+        } else {
+            // On the surface itself: up from it.
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+            let sgn = if n[2] < 0.0 { -1.0 } else { 1.0 };
+            [n[0] / l * sgn, n[1] / l * sgn, n[2] / l * sgn]
+        };
+        let sgn = if flip { -1.0 } else { 1.0 };
+        p = [q[0] + dir[0] * off * sgn, q[1] + dir[1] * off * sgn, q[2] + dir[2] * off * sgn];
+        if flip {
+            // Done: on the other side now, which is the far side of the band.
+            return p;
+        }
+    }
+    p
+}
+
+/// Where a polyline first comes closest to the triangles: segment and position
+/// on it. Where it reaches the surface, that is the first point on it.
+/// shortcut: samples every 0.5 mm and tests every triangle, so a very long path
+/// against a very fine surface is slow; add a grid or bounds test if it shows.
+fn nearest_on_surface(path: &[V3], tris: &[[V3; 3]]) -> Option<(usize, f64)> {
+    let mut best: Option<(f64, usize, f64)> = None;
+    for i in 0..path.len().saturating_sub(1) {
+        let (a, b) = (path[i], path[i + 1]);
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt();
+        let n = (len / 0.5).ceil().max(1.0) as usize;
+        for k in 0..=n {
+            let t = k as f64 / n as f64;
+            let p = lerp(a, b, t);
+            let d = tris.iter().map(|tr| point_tri_dist2(p, tr)).fold(f64::MAX, f64::min);
+            if best.is_none_or(|x| d < x.0 - 1e-9) {
+                best = Some((d, i, t));
+            }
+        }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
+/// Where a polyline comes closest to any of `targets`: segment index and the
+/// position along that segment (0..1).
+fn nearest_on(path: &[V3], targets: &[V3]) -> Option<(usize, f64)> {
+    let mut best: Option<(f64, usize, f64)> = None;
+    for i in 0..path.len().saturating_sub(1) {
+        let (a, b) = (path[i], path[i + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        for q in targets {
+            let t = if l2 < 1e-18 { 0.0 } else { (((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1] + (q[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0) };
+            let d2 = (0..3).map(|k| (a[k] + ab[k] * t - q[k]).powi(2)).sum::<f64>();
+            if best.is_none_or(|x| d2 < x.0) {
+                best = Some((d2, i, t));
+            }
+        }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
+fn lerp(a: V3, b: V3, t: f64) -> V3 {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// Length of the polyline up to each point.
+fn cumulative(pts: &[V3]) -> Vec<f64> {
+    let mut cum = vec![0.0];
+    for w in pts.windows(2) {
+        let l = ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2) + (w[1][2] - w[0][2]).powi(2)).sqrt();
+        cum.push(cum.last().copied().unwrap_or(0.0) + l);
+    }
+    cum
+}
+
+/// The part of the polyline between two distances along it. Empty when the
+/// end is not past the start.
+fn cut_range(pts: &[V3], cum: &[f64], s0: f64, s1: f64) -> Vec<V3> {
+    if s1 <= s0 || pts.len() < 2 {
+        return vec![];
+    }
+    let at = |s: f64| {
+        let i = cum.partition_point(|&c| c <= s).saturating_sub(1).min(pts.len() - 2);
+        let l = cum[i + 1] - cum[i];
+        (i, if l < 1e-12 { 0.0 } else { ((s - cum[i]) / l).clamp(0.0, 1.0) })
+    };
+    let ((i0, t0), (i1, t1)) = (at(s0), at(s1));
+    let mut out = vec![lerp(pts[i0], pts[i0 + 1], t0)];
+    out.extend_from_slice(&pts[i0 + 1..=i1]);
+    out.push(lerp(pts[i1], pts[i1 + 1], t1));
+    out
 }
 
 /// Split a polyline so no piece is longer than `max`.
@@ -566,12 +1031,19 @@ mod tests {
         p
     }
 
+    /// A path step on the edge of the plate, with its flat face as surface.
+    fn path_step() -> Step3 {
+        let mut s = Step3::new(Kind3::Path);
+        s.path = Some((0, 0));
+        s.surface = Some((0, 0));
+        s
+    }
+
     #[test]
     fn z_gap_follows_the_surface() {
         let mut p = plate();
-        let mut s = p.new_edge_step(0, 0);
-        assert_eq!(s.surface, Some((0, 0)));
-        s.gap = Some(1.5);
+        let mut s = path_step();
+        s.over.z_gap = Some(1.5);
         p.job.sample_mm = 5.0;
         let pts = p.step_points(&s);
         assert_eq!(pts.len(), 3);
@@ -580,33 +1052,158 @@ mod tests {
         assert!((pts[0][0] - 7.0).abs() < 1e-9);
         s.reverse = true;
         assert!((p.step_points(&s)[0][0] - 17.0).abs() < 1e-9);
+        // A step without a path has no points.
+        assert!(p.step_points(&Step3::new(Kind3::Path)).is_empty());
     }
 
     #[test]
-    fn tool_diameter_offsets_the_path_sideways() {
+    fn offsets_default_to_the_tool_offset_and_can_be_changed_and_flipped() {
         let mut p = plate();
         p.job.tool_diameter = 2.0;
         p.job.z_gap = 0.0;
         p.job.sample_mm = 50.0;
         // Edge from (7,5) to (17,5) on a face whose middle is at (15,10):
-        // outside is toward -Y.
-        let mut s = p.new_edge_step(0, 0);
+        // away from it is toward -Y. The path offset is the tool radius.
+        let mut s = path_step();
         let pts = p.step_points(&s);
+        assert_eq!(pts.len(), 2);
         assert!((pts[0][1] - 4.0).abs() < 1e-9 && (pts[0][0] - 7.0).abs() < 1e-9, "{pts:?}");
         assert!((pts[0][2] - 10.0).abs() < 1e-9, "Z stays on the surface");
-        s.side = Side::Inside;
+        s.offset_flip = true;
         assert!((p.step_points(&s)[0][1] - 6.0).abs() < 1e-9);
-        s.side = Side::Left; // travelling +X, left is +Y
-        assert!((p.step_points(&s)[0][1] - 6.0).abs() < 1e-9);
-        s.side = Side::None;
+        // Changed by hand, flipped or not.
+        s.offset = Some(3.0);
+        assert!((p.step_points(&s)[0][1] - 8.0).abs() < 1e-9);
+        s.offset_flip = false;
+        assert!((p.step_points(&s)[0][1] - 2.0).abs() < 1e-9);
+        // No tool diameter and no offset set: the path stays on the edge.
+        s.offset = None;
+        p.job.tool_diameter = 0.0;
         assert!((p.step_points(&s)[0][1] - 5.0).abs() < 1e-9);
     }
 
     #[test]
+    fn start_and_stop_offsets_default_to_the_tool_radius() {
+        let mut p = plate();
+        p.job.tool_diameter = 2.0; // radius 1
+        p.job.sample_mm = 50.0;
+        let mut s = path_step(); // x = 7 .. 17
+        s.start = Some(Limit::Point([10.0, 5.0, 0.0]));
+        s.stop = Some(Limit::Point([14.0, 5.0, 0.0]));
+        let v = p.step_points(&s);
+        assert!((v[0][0] - 11.0).abs() < 1e-9 && (v.last().unwrap()[0] - 13.0).abs() < 1e-9, "{v:?}");
+        // Without a start or stop the whole edge is used.
+        s.start = None;
+        s.stop = None;
+        let v = p.step_points(&s);
+        assert!((v[0][0] - 7.0).abs() < 1e-9 && (v.last().unwrap()[0] - 17.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn start_and_stop_cut_the_path() {
+        let mut p = plate();
+        p.job.sample_mm = 50.0;
+        let mut s = path_step();
+        s.start = Some(Limit::Point([10.0, 9.0, 0.0]));
+        s.stop = Some(Limit::Point([14.0, 1.0, 0.0]));
+        let pts = p.step_points(&s);
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0][0] - 10.0).abs() < 1e-9 && (pts[1][0] - 14.0).abs() < 1e-9, "{pts:?}");
+    }
+
+    #[test]
+    fn start_and_stop_offsets_move_the_ends_and_flip() {
+        let mut p = plate();
+        p.job.sample_mm = 50.0;
+        let mut s = path_step(); // x = 7 .. 17
+        s.start = Some(Limit::Point([10.0, 5.0, 0.0]));
+        s.stop = Some(Limit::Point([14.0, 5.0, 0.0]));
+        s.start_offset = Some(1.0);
+        s.stop_offset = Some(2.0);
+        let x = |s: &Step3| { let v = p.step_points(s); (v[0][0], v.last().unwrap()[0]) };
+        // Inward: later start, earlier stop.
+        let (a, b) = x(&s);
+        assert!((a - 11.0).abs() < 1e-9 && (b - 12.0).abs() < 1e-9, "{a} {b}");
+        // Each toggles on its own.
+        s.start_flip = true;
+        let (a, b) = x(&s);
+        assert!((a - 9.0).abs() < 1e-9 && (b - 12.0).abs() < 1e-9, "{a} {b}");
+        s.stop_flip = true;
+        let (a, b) = x(&s);
+        assert!((a - 9.0).abs() < 1e-9 && (b - 16.0).abs() < 1e-9, "{a} {b}");
+        // Never past the ends of the edge.
+        s.start_offset = Some(100.0);
+        s.stop_offset = Some(100.0);
+        let (a, b) = x(&s);
+        assert!((a - 7.0).abs() < 1e-9 && (b - 17.0).abs() < 1e-9, "{a} {b}");
+        // An inward offset larger than the path leaves nothing.
+        s.start_flip = false;
+        s.stop_flip = false;
+        assert!(p.step_points(&s).is_empty());
+    }
+
+    #[test]
+    fn start_and_stop_set_the_direction() {
+        let mut p = plate();
+        p.job.sample_mm = 50.0;
+        let mut s = path_step(); // the edge runs from x = 7 to x = 17
+        s.start = Some(Limit::Point([16.0, 5.0, 0.0]));
+        s.stop = Some(Limit::Point([9.0, 5.0, 0.0]));
+        let pts = p.step_points(&s);
+        assert!((pts[0][0] - 16.0).abs() < 1e-9 && (pts[1][0] - 9.0).abs() < 1e-9, "{pts:?}");
+        // Start and stop at the same place leave no path.
+        s.stop = s.start;
+        assert!(p.step_points(&s).is_empty());
+    }
+
+    #[test]
+    fn a_surface_can_be_the_start_or_the_stop() {
+        let mut p = plate();
+        p.job.sample_mm = 50.0;
+        // A wall across the path at x = 12.
+        let q = |a: V3, b: V3, c: V3| [a, b, c];
+        let wall = super::step::FaceMesh {
+            tris: vec![
+                q([12.0, 0.0, 0.0], [12.0, 20.0, 0.0], [12.0, 20.0, 20.0]),
+                q([12.0, 0.0, 0.0], [12.0, 20.0, 20.0], [12.0, 0.0, 20.0]),
+            ],
+            nors: vec![],
+        };
+        let geo = Geometry { faces: vec![wall], min: [12.0, 0.0, 0.0], max: [12.0, 20.0, 20.0], ..Default::default() };
+        p.bodies.push(Body::new("wall".into(), String::new(), [0.0; 3], Some(Arc::new(geo))));
+        let mut s = path_step(); // x = 7 .. 17
+        s.start = Some(Limit::Surface(1, 0));
+        let pts = p.step_points(&s);
+        assert!((pts[0][0] - 12.0).abs() < 1e-9 && (pts.last().unwrap()[0] - 17.0).abs() < 1e-9, "{pts:?}");
+        s.start = None;
+        s.stop = Some(Limit::Surface(1, 0));
+        let pts = p.step_points(&s);
+        assert!((pts[0][0] - 7.0).abs() < 1e-9 && (pts.last().unwrap()[0] - 12.0).abs() < 1e-9, "{pts:?}");
+        // The distance to a triangle: on it, beside it, and past a corner.
+        let t = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        assert!(point_tri_dist2([2.0, 2.0, 0.0], &t) < 1e-12);
+        assert!((point_tri_dist2([2.0, 2.0, 3.0], &t) - 9.0).abs() < 1e-9);
+        assert!((point_tri_dist2([-3.0, -4.0, 0.0], &t) - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn removing_a_part_clears_what_pointed_at_it() {
+        let mut p = plate();
+        let mut s = path_step();
+        s.start = Some(Limit::Edge(0, 0));
+        s.stop = Some(Limit::Surface(0, 0));
+        p.sequence.push(s);
+        p.remove_body(0);
+        let s = p.sequence[0].clone();
+        assert!(s.path.is_none() && s.surface.is_none() && s.start.is_none() && s.stop.is_none());
+    }
+
+    #[test]
     fn corners_are_mitred() {
-        // An L: right along +X then up +Y, offset to the right (outside the turn).
+        // An L: right along +X then up +Y. Away from a point inside the turn
+        // is to the right of the travel direction.
         let mut pts = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0]];
-        offset_polyline(&mut pts, 1.0, Side::Right, [0.0, 0.0]);
+        offset_polyline(&mut pts, 1.0, false, [5.0, 5.0]);
         assert!((pts[0][1] + 1.0).abs() < 1e-9);
         assert!((pts[1][0] - 11.0).abs() < 1e-9 && (pts[1][1] + 1.0).abs() < 1e-9, "{pts:?}");
         assert!((pts[2][0] - 11.0).abs() < 1e-9);
@@ -654,5 +1251,111 @@ mod tests {
         assert!((lo[2] - 5.0).abs() < 1e-9);
         assert!((hi[0] - lo[0] - 20.0).abs() < 1e-9 && (hi[1] - lo[1] - 10.0).abs() < 1e-9);
         assert!(((lo[0] + hi[0]) / 2.0 - 105.0).abs() < 1e-9);
+    }
+
+    /// A square post, 4 x 4 around (10, 10), z 0..10, made of its four sides.
+    fn post() -> Vec<Vec<[V3; 3]>> {
+        let q = |a: V3, b: V3| vec![[a, b, [b[0], b[1], 10.0]], [a, [b[0], b[1], 10.0], [a[0], a[1], 10.0]]];
+        let sides = [
+            q([8.0, 8.0, 0.0], [12.0, 8.0, 0.0]),
+            q([12.0, 8.0, 0.0], [12.0, 12.0, 0.0]),
+            q([12.0, 12.0, 0.0], [8.0, 12.0, 0.0]),
+            q([8.0, 12.0, 0.0], [8.0, 8.0, 0.0]),
+        ];
+        vec![sides.into_iter().flatten().collect()]
+    }
+
+    #[test]
+    fn a_lead_in_through_a_post_goes_around_it_on_the_chosen_side() {
+        let f = post();
+        let in_post = |p: &V3| p[0] > 8.0 && p[0] < 12.0 && p[1] > 8.0 && p[1] < 12.0 && p[2] < 10.0;
+        // Straight through the middle, 41 points from x = 0 to 20.
+        let line: Vec<V3> = (0..=40).map(|k| [k as f64 * 0.5, 10.0, 5.0]).collect();
+        for side in [1.0, -1.0] {
+            let mut pts = line.clone();
+            assert!(bypass(&f, &mut pts, 0.4, side));
+            assert_eq!(pts[0], line[0]);
+            assert_eq!(pts[40], line[40]);
+            assert!(pts.iter().all(|p| !in_post(p)), "{pts:?}");
+            // Left of +X is +Y: round the far side of the post, 2 + 0.4 away.
+            let far = pts.iter().map(|p| (p[1] - 10.0) * side).fold(f64::MIN, f64::max);
+            assert!(far >= 2.4 - 1e-6, "{far}");
+            // Never on the other side.
+            assert!(pts.iter().all(|p| (p[1] - 10.0) * side >= -1e-9));
+            // Smooth: it moves sideways no faster than it goes along.
+            assert!(pts.windows(2).all(|w| (w[1][1] - w[0][1]).abs() <= 0.5 + 1e-6), "{pts:?}");
+        }
+        // Above the post, or not through anything: nothing changes.
+        let high: Vec<V3> = line.iter().map(|p| [p[0], p[1], 15.0]).collect();
+        let mut pts = high.clone();
+        assert!(!bypass(&f, &mut pts, 0.4, 1.0));
+        assert_eq!(pts, high);
+        let beside: Vec<V3> = line.iter().map(|p| [p[0], 20.0, 5.0]).collect();
+        let mut pts = beside.clone();
+        assert!(!bypass(&f, &mut pts, 0.4, 1.0));
+        // A single wall, not a closed solid, is gone round the same way.
+        let wall = vec![vec![[[10.0, 6.0, 0.0], [10.0, 14.0, 0.0], [10.0, 14.0, 10.0]], [[10.0, 6.0, 0.0], [10.0, 14.0, 10.0], [10.0, 6.0, 10.0]]]];
+        let mut pts = line.clone();
+        assert!(bypass(&wall, &mut pts, 0.4, 1.0));
+        assert!(pts.iter().all(|p| (p[0] - 10.0).abs() > 1e-9 || (p[1] - 10.0).abs() >= 4.4 - 1e-6), "{pts:?}");
+    }
+
+    #[test]
+    fn keep_out_pushes_a_point_away_on_the_side_it_is_on() {
+        // A wall in the plane y = 0, x 0..20, z 0..20.
+        let wall = vec![[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0]], [[0.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]]];
+        let f = vec![wall];
+        assert_eq!(keep_out(&f, [5.0, -0.5, 5.0], 2.0, false), [5.0, -2.0, 5.0]);
+        assert_eq!(keep_out(&f, [5.0, 0.5, 5.0], 2.0, false), [5.0, 2.0, 5.0]);
+        assert_eq!(keep_out(&f, [5.0, -3.0, 5.0], 2.0, false), [5.0, -3.0, 5.0]);
+        // Past the end of the wall it is the end that matters.
+        assert_eq!(keep_out(&f, [21.0, 0.0, 5.0], 2.0, false), [22.0, 0.0, 5.0]);
+        // Flipped: to the other side of the wall.
+        assert_eq!(keep_out(&f, [5.0, -0.5, 5.0], 2.0, true), [5.0, 2.0, 5.0]);
+        assert_eq!(keep_out(&f, [5.0, -3.0, 5.0], 2.0, true), [5.0, -3.0, 5.0]);
+    }
+
+    #[test]
+    fn lead_in_runs_from_the_previous_end_and_follows_picked_surfaces() {
+        let mut p = plate();
+        p.job.sample_mm = 5.0;
+        p.job.z_gap = 0.0;
+        // Step 0: a go to above the plate; step 1: the path at x 7 .. 17, y 5, z 10.
+        p.sequence.push(Step3::new(Kind3::Goto { x: 27.0, y: 5.0, z: 30.0 }));
+        p.sequence.push(path_step());
+        let lead = p.lead_in_points(1);
+        // From the go to point to the start of the path: 28.3 mm in 5 mm pieces.
+        assert_eq!(lead.len(), 7, "{lead:?}");
+        assert_eq!(lead[0], [27.0, 5.0, 30.0]);
+        assert!((lead[6][0] - 7.0).abs() < 1e-9 && (lead[6][2] - 10.0).abs() < 1e-9);
+        // With no surface the height is a straight run.
+        assert!((lead[3][2] - (lead[0][2] + lead[6][2]) / 2.0).abs() < 1e-9);
+        // Following the flat face (z = 10, x 5..25) at 2 mm: never closer than that.
+        p.sequence[1].lead_surfaces = vec![(0, 0)];
+        p.sequence[1].lead_offset = Some(2.0);
+        let lead = p.lead_in_points(1);
+        let inner = &lead[1..lead.len() - 1];
+        assert!(inner.iter().all(|q| q[2] >= 12.0 - 1e-9), "{lead:?}");
+        assert!(inner.iter().any(|q| (q[2] - 12.0).abs() < 1e-9), "some are pushed up to the offset");
+        // Flipped, the points that were in the way go to the far side, below it.
+        p.sequence[1].lead_flip = true;
+        let flipped = p.lead_in_points(1);
+        assert!(flipped[1..flipped.len() - 1].iter().any(|q| q[2] < 10.0), "{flipped:?}");
+        p.sequence[1].lead_flip = false;
+        // The two ends stay where the steps put them.
+        assert_eq!(lead[0], [27.0, 5.0, 30.0]);
+        assert!((lead.last().unwrap()[2] - 10.0).abs() < 1e-9);
+        // The first step, a step that is not a path, or the switch off: no lead in.
+        assert!(p.lead_in_points(0).is_empty());
+        p.sequence[1].lead_in = false;
+        assert!(p.lead_in_points(1).is_empty());
+    }
+
+    #[test]
+    fn opened_steps_are_collapsed_and_new_ones_expanded() {
+        let s = Step3::new(Kind3::Path);
+        assert!(s.open);
+        let back: Step3 = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.open);
     }
 }

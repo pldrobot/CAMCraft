@@ -110,25 +110,6 @@ impl Geometry {
         self.min = lo;
         self.max = hi;
     }
-
-    /// Area-weighted normal of a face, flipped to point up.
-    pub fn face_normal(&self, face: usize) -> V3 {
-        let mut n = [0.0; 3];
-        if let Some(f) = self.faces.get(face) {
-            for t in &f.tris {
-                let c = tri_normal(t);
-                for k in 0..3 {
-                    n[k] += c[k];
-                }
-            }
-        }
-        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        if l < 1e-12 {
-            return [0.0, 0.0, 1.0];
-        }
-        let s = if n[2] < 0.0 { -1.0 } else { 1.0 } / l;
-        [n[0] * s, n[1] * s, n[2] * s]
-    }
 }
 
 /// Cross product of two edges, so its length is twice the area.

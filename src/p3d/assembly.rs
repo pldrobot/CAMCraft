@@ -6,7 +6,7 @@
 //! those placements and returns, for each solid, the matrix of every instance.
 
 use super::step::V3;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// 3x4 affine matrix. Rows give x', y', z'; the last column is the shift.
 pub type M = [[f64; 4]; 3];
@@ -190,8 +190,8 @@ const WANTED: [&str; 9] = [
     "ORIENTED_CLOSED_SHELL",
 ];
 
-fn parse(text: &str) -> HashMap<u32, Ent> {
-    let mut ents: HashMap<u32, Ent> = HashMap::new();
+fn parse(text: &str) -> BTreeMap<u32, Ent> {
+    let mut ents: BTreeMap<u32, Ent> = BTreeMap::new();
     let Some(start) = text.find("DATA;") else { return ents };
     let b = text.as_bytes();
     let mut i = start + 5;
@@ -259,7 +259,7 @@ fn num_list(p: &P) -> Option<V3> {
     (v.len() >= 3).then(|| [v[0], v[1], v[2]])
 }
 
-fn point_or_dir(ents: &HashMap<u32, Ent>, p: Option<&P>, name: &str) -> Option<V3> {
+fn point_or_dir(ents: &BTreeMap<u32, Ent>, p: Option<&P>, name: &str) -> Option<V3> {
     let P::Ref(r) = p? else { return None };
     num_list(kind(ents.get(r)?, name)?.get(1)?)
 }
@@ -273,7 +273,7 @@ fn cross(a: V3, b: V3) -> V3 {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-fn placement(ents: &HashMap<u32, Ent>, id: u32) -> Option<M> {
+fn placement(ents: &BTreeMap<u32, Ent>, id: u32) -> Option<M> {
     let e = kind(ents.get(&id)?, "AXIS2_PLACEMENT_3D")?;
     let loc = point_or_dir(ents, e.get(1), "CARTESIAN_POINT")?;
     let z = norm(point_or_dir(ents, e.get(2), "DIRECTION").unwrap_or([0.0, 0.0, 1.0]));
@@ -293,7 +293,7 @@ fn refs(p: Option<&P>) -> Vec<u32> {
 }
 
 /// Shell ids of a solid or shell model.
-fn solid_shells(ents: &HashMap<u32, Ent>, id: u32) -> Option<Vec<u64>> {
+fn solid_shells(ents: &BTreeMap<u32, Ent>, id: u32) -> Option<Vec<u64>> {
     let e = ents.get(&id)?;
     if let Some(a) = kind(e, "MANIFOLD_SOLID_BREP") {
         return Some(refs(a.get(1)).into_iter().map(u64::from).collect());
@@ -331,7 +331,7 @@ pub fn resolve(text: &str) -> Option<Vec<Instance>> {
     }
 
     // Items of every shape representation.
-    let mut items: HashMap<u32, Vec<Item>> = HashMap::new();
+    let mut items: BTreeMap<u32, Vec<Item>> = BTreeMap::new();
     for (&id, e) in &ents {
         let Some(args) = e.iter().find(|k| k.0.ends_with("REPRESENTATION") && matches!(k.1.get(1), Some(P::List(_)))).map(|k| &k.1) else {
             continue;
@@ -361,7 +361,7 @@ pub fn resolve(text: &str) -> Option<Vec<Instance>> {
     }
 
     // Relationships between representations: parent (rep_1) to child (rep_2).
-    let mut has_parent: HashMap<u32, bool> = HashMap::new();
+    let mut has_parent: BTreeMap<u32, bool> = BTreeMap::new();
     for (_, e) in &ents {
         let Some(base) = kind(e, "REPRESENTATION_RELATIONSHIP").or_else(|| kind(e, "SHAPE_REPRESENTATION_RELATIONSHIP")) else {
             continue;
@@ -391,7 +391,7 @@ pub fn resolve(text: &str) -> Option<Vec<Instance>> {
     let mut roots: Vec<u32> = items.keys().copied().filter(|k| !has_parent.contains_key(k)).collect();
     roots.sort_unstable();
     let mut out: Vec<Instance> = vec![];
-    fn walk(items: &HashMap<u32, Vec<Item>>, rep: u32, m: &M, depth: usize, out: &mut Vec<Instance>) {
+    fn walk(items: &BTreeMap<u32, Vec<Item>>, rep: u32, m: &M, depth: usize, out: &mut Vec<Instance>) {
         if depth > 64 {
             return;
         }
