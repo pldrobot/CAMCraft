@@ -1,6 +1,7 @@
 mod canvas;
 mod dxf_import;
 mod gcode;
+mod icons;
 mod model;
 mod preview;
 mod theme;
@@ -32,6 +33,7 @@ enum ProjectTab {
     Prepare,
     PathSelection,
     Preview,
+    Gcode,
 }
 
 enum Action {
@@ -39,6 +41,7 @@ enum Action {
     OpenProject,
     SaveProject(bool), // true = save as
     InsertDxf,
+    ChangeLayers(usize),
     Generate,
     SaveGcode,
     CopyGcode,
@@ -46,6 +49,9 @@ enum Action {
 
 struct PendingDxf {
     name: String,
+    source: String,
+    /// Part whose layers are being changed; None for a new part.
+    replace: Option<usize>,
     drawing: dxf::Drawing,
     /// Layer name, entity count, selected for import.
     layers: Vec<(String, usize, bool)>,
@@ -59,7 +65,6 @@ struct App {
     project_path: Option<PathBuf>,
     canvas: Canvas,
     gcode: String,
-    gcode_open: bool,
     warnings: Vec<String>,
     log: Vec<String>,
     show_new: bool,
@@ -70,6 +75,8 @@ struct App {
     tab: ProjectTab,
     preview: Preview,
     pending_dxf: Option<PendingDxf>,
+    /// Sequence step being dragged to a new place.
+    seq_drag: Option<usize>,
 }
 
 impl App {
@@ -84,7 +91,6 @@ impl App {
             project_path: None,
             canvas: Canvas::default(),
             gcode: String::new(),
-            gcode_open: false,
             warnings: vec![],
             log: vec!["CAMCraft ready. Command: New Project".into()],
             show_new: false,
@@ -95,6 +101,7 @@ impl App {
             tab: ProjectTab::Prepare,
             preview: Preview::default(),
             pending_dxf: None,
+            seq_drag: None,
         }
     }
 
@@ -178,12 +185,37 @@ impl App {
                     .into_iter()
                     .map(|(n, c)| (n, c, true))
                     .collect();
+                let source = path.to_string_lossy().to_string();
                 if layers.len() <= 1 {
+                    let names = layers.into_iter().map(|l| l.0).collect();
                     let r = dxf_import::import(&drawing);
-                    self.add_part(name, r);
+                    self.add_part(name, source, names, r, None);
                 } else {
-                    self.pending_dxf = Some(PendingDxf { name, drawing, layers });
+                    self.pending_dxf = Some(PendingDxf { name, source, replace: None, drawing, layers });
                 }
+            }
+            Action::ChangeLayers(pi) => {
+                let Some(part) = self.project.as_ref().and_then(|p| p.parts.get(pi)) else { return };
+                if part.source.is_empty() {
+                    self.say("This part has no DXF source, so its layers cannot be changed.");
+                    return;
+                }
+                let (name, source, current) = (part.name.clone(), part.source.clone(), part.layers.clone());
+                let drawing = match dxf_import::load_drawing(std::path::Path::new(&source)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.say(format!("Cannot reload {source}: {e}"));
+                        return;
+                    }
+                };
+                let layers: Vec<(String, usize, bool)> = dxf_import::layers(&drawing)
+                    .into_iter()
+                    .map(|(n, c)| {
+                        let on = current.is_empty() || current.contains(&n);
+                        (n, c, on)
+                    })
+                    .collect();
+                self.pending_dxf = Some(PendingDxf { name, source, replace: Some(pi), drawing, layers });
             }
             Action::Generate => {
                 // The project holds a copy of its machine. Take the current
@@ -199,8 +231,7 @@ impl App {
                 self.preview.set_moves(r.moves, &project.job);
                 self.gcode = r.text;
                 self.warnings = r.warnings;
-                self.gcode_open = true;
-                self.say(format!("G-code generated: {lines} lines, {} warning(s).", self.warnings.len()));
+                        self.say(format!("G-code generated: {lines} lines, {} warning(s).", self.warnings.len()));
             }
             Action::SaveGcode => {
                 let ext = "gcode";
@@ -222,7 +253,7 @@ impl App {
         }
     }
 
-    fn add_part(&mut self, name: String, r: dxf_import::ImportResult) {
+    fn add_part(&mut self, name: String, source: String, layers: Vec<String>, r: dxf_import::ImportResult, replace: Option<usize>) {
         if r.paths.is_empty() {
             self.say("No usable geometry found in the DXF.");
             return;
@@ -237,8 +268,20 @@ impl App {
         let n = r.paths.len();
         let (w, h) = (maxx - minx, maxy - miny);
         let Some(project) = &mut self.project else { return };
+        if let Some(pi) = replace.filter(|&i| i < project.parts.len()) {
+            // Same DXF origin and position, new set of paths. The old
+            // sequence refers to paths that no longer exist.
+            let part = &mut project.parts[pi];
+            part.paths = r.paths;
+            part.layers = layers;
+            project.clear_part_sequence(pi);
+            self.say(format!("Layers of {name} changed: {n} paths."));
+            return;
+        }
         project.parts.push(Part {
             name: name.clone(),
+            source,
+            layers,
             paths: r.paths,
             // Put the lower-left corner of the drawing 5 mm inside the workable area.
             offset: [
@@ -270,7 +313,7 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("{}: choose the layers to import", p.name));
+                ui.label(format!("{}: choose the layers to use", p.name));
                 ui.horizontal(|ui| {
                     if ui.small_button("All").clicked() {
                         p.layers.iter_mut().for_each(|l| l.2 = true);
@@ -301,7 +344,8 @@ impl App {
                 let set: HashSet<String> =
                     p.layers.iter().filter(|l| l.2).map(|l| l.0.clone()).collect();
                 let r = dxf_import::import_layers(&p.drawing, Some(&set));
-                self.add_part(p.name, r);
+                let names: Vec<String> = p.layers.iter().filter(|l| l.2).map(|l| l.0.clone()).collect();
+                self.add_part(p.name, p.source, names, r, p.replace);
             }
         } else if cancel || !open {
             self.pending_dxf = None;
@@ -437,10 +481,10 @@ impl App {
             return;
         }
 
-        let Self { lib, project, canvas, gcode, gcode_open, warnings, tab, preview, .. } = self;
+        let Self { lib, project, canvas, gcode, warnings, tab, preview, seq_drag, .. } = self;
         let project = project.as_mut().unwrap();
         let generated = preview.has_path();
-        if *tab == ProjectTab::Preview && !generated {
+        if matches!(*tab, ProjectTab::Preview | ProjectTab::Gcode) && !generated {
             *tab = ProjectTab::Prepare;
         }
 
@@ -451,6 +495,8 @@ impl App {
                 ui.add_enabled_ui(generated, |ui| {
                     ui.selectable_value(tab, ProjectTab::Preview, "Preview")
                         .on_disabled_hover_text("Generate G-code first.");
+                    ui.selectable_value(tab, ProjectTab::Gcode, "G-code")
+                        .on_disabled_hover_text("Generate G-code first.");
                 });
             });
         });
@@ -458,15 +504,32 @@ impl App {
         match *tab {
             ProjectTab::Prepare => canvas.tool = Tool::Move,
             ProjectTab::PathSelection => canvas.tool = Tool::Sequence,
-            ProjectTab::Preview => {}
+            ProjectTab::Preview | ProjectTab::Gcode => {}
         }
 
-        egui::Panel::left("left").default_size(310.0).show(root, |ui| {
+        egui::Panel::left("left").resizable(false).exact_size(330.0).show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match *tab {
                     ProjectTab::Prepare => {
+                        let mut reload = false;
+                        ui.horizontal(|ui| {
+                            ui.heading("Machine");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                reload = icons::icon_button(
+                                    ui,
+                                    icons::Icon::Reload,
+                                    "Reload machine settings. The project keeps a copy of the machine and its speeds. Use this after editing the machine in Machines.",
+                                )
+                                .clicked();
+                            });
+                        });
+                        if reload {
+                            if let Some(m) = lib.machines.iter().find(|m| m.name == project.machine.name) {
+                                project.job = m.job.clone();
+                                project.machine = m.clone();
+                            }
+                        }
                         let m = &project.machine;
-                        ui.heading("Machine");
                         ui.label(format!(
                             "{}   bed {} x {} x {} mm",
                             m.name, m.bed_x, m.bed_y, m.bed_z
@@ -487,86 +550,68 @@ impl App {
                             .small()
                             .weak(),
                         );
-                        if ui
-                            .button("Reload machine settings")
-                            .on_hover_text("The project keeps a copy of the machine and its speeds. Use this after editing the machine in Machines.")
-                            .clicked()
-                        {
-                            if let Some(m) = lib.machines.iter().find(|m| m.name == project.machine.name) {
-                                project.job = m.job.clone();
-                                project.machine = m.clone();
-                            }
-                        }
                         ui.separator();
 
-                        ui.heading("Parts");
-                        if ui.button("Insert DXF...").clicked() {
-                            actions.push(Action::InsertDxf);
-                        }
-                        let mut remove: Option<usize> = None;
-                        for pi in 0..project.parts.len() {
-                            let selected = canvas.selected_part == Some(pi);
-                            ui.horizontal(|ui| {
-                                let name = format!(
-                                    "{}  ({} paths)",
-                                    project.parts[pi].name,
-                                    project.parts[pi].paths.len()
-                                );
-                                if ui.selectable_label(selected, name).clicked() {
-                                    canvas.selected_part = Some(pi);
-                                }
-                                if ui.small_button("x").on_hover_text("Remove part").clicked() {
-                                    remove = Some(pi);
+                        ui.horizontal(|ui| {
+                            ui.heading("Parts");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Insert DXF...").clicked() {
+                                    actions.push(Action::InsertDxf);
                                 }
                             });
-                            if selected {
-                                let part = &mut project.parts[pi];
-                                // Show the lower-left corner of the drawing on the bed, not the
-                                // DXF origin, which can be far from the geometry.
-                                let mut c = part.min_corner();
-                                let before = c;
-                                ui.horizontal(|ui| {
-                                    ui.label("   X");
-                                    ui.add(egui::DragValue::new(&mut c[0]).speed(0.1).suffix(" mm"));
-                                    ui.label("Y");
-                                    ui.add(egui::DragValue::new(&mut c[1]).speed(0.1).suffix(" mm"));
-                                });
-                                part.offset[0] += c[0] - before[0];
-                                part.offset[1] += c[1] - before[1];
-                            }
+                        });
+                        let mut remove: Option<usize> = None;
+                        if project.parts.is_empty() {
+                            ui.label(RichText::new("No DXF inserted yet.").small().weak());
+                        } else {
+                            egui::Grid::new("parts_table").num_columns(5).striped(true).spacing([6.0, 4.0]).show(ui, |ui| {
+                                ui.label(RichText::new("DXF").small().weak());
+                                ui.label(RichText::new("X mm").small().weak());
+                                ui.label(RichText::new("Y mm").small().weak());
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                                for pi in 0..project.parts.len() {
+                                    let selected = canvas.selected_part == Some(pi);
+                                    let part = &mut project.parts[pi];
+                                    let name = RichText::new(part.name.as_str());
+                                    if ui
+                                        .add(egui::Button::selectable(selected, name).truncate())
+                                        .on_hover_text(format!("{}\n{} paths", part.name, part.paths.len()))
+                                        .clicked()
+                                    {
+                                        canvas.selected_part = Some(pi);
+                                    }
+                                    // Lower-left corner of the drawing on the bed, not the
+                                    // DXF origin, which can be far from the geometry.
+                                    let mut c = part.min_corner();
+                                    let before = c;
+                                    ui.add(egui::DragValue::new(&mut c[0]).speed(0.1).fixed_decimals(2));
+                                    ui.add(egui::DragValue::new(&mut c[1]).speed(0.1).fixed_decimals(2));
+                                    part.offset[0] += c[0] - before[0];
+                                    part.offset[1] += c[1] - before[1];
+                                    if icons::icon_button(ui, icons::Icon::Layers, "Change layers").clicked() {
+                                        actions.push(Action::ChangeLayers(pi));
+                                    }
+                                    if icons::icon_button(ui, icons::Icon::Remove, "Remove DXF").clicked() {
+                                        remove = Some(pi);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                         }
                         if let Some(i) = remove {
                             project.remove_part(i);
                             canvas.selected_part = None;
                         }
-                        ui.separator();
-
+                    }
+                    ProjectTab::PathSelection => {
                         ui.heading("Job settings");
-                        let j = &mut project.job;
-                        egui::Grid::new("job").num_columns(2).show(ui, |ui| {
-                            ui.label("Work feed");
-                            ui.add(egui::DragValue::new(&mut j.dispense_feed).speed(5.0).range(1.0..=20000.0).suffix(" mm/min"));
-                            ui.end_row();
-                            ui.label("Travel feed");
-                            ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"));
-                            ui.end_row();
-                            ui.label("Use Z axis");
-                            ui.checkbox(&mut j.use_z, "");
-                            ui.end_row();
-                            ui.add_enabled_ui(j.use_z, |ui| ui.label("Safe Z"));
-                            ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm"));
-                            ui.end_row();
-                            ui.add_enabled_ui(j.use_z, |ui| ui.label("Work Z"));
-                            ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm"));
-                            ui.end_row();
-                            ui.label("Start delay");
-                            ui.add(egui::DragValue::new(&mut j.on_delay_ms).speed(5.0).suffix(" ms"));
-                            ui.end_row();
-                            ui.label("Stop delay");
-                            ui.add(egui::DragValue::new(&mut j.off_delay_ms).speed(5.0).suffix(" ms"));
-                            ui.end_row();
-                        });
-                        ui.add_space(8.0);
+                        job_settings_grid(ui, &mut project.job);
+                        ui.separator();
+                        sequence_ui(ui, project, &mut canvas.sel_steps, seq_drag);
+                        ui.separator();
+                        ui.add_space(4.0);
                         if ui
                             .add_sized([ui.available_width(), 30.0], egui::Button::new(RichText::new("Generate G-code").strong()).fill(theme::ACCENT))
                             .clicked()
@@ -577,70 +622,18 @@ impl App {
                             ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
                         }
                     }
-                    ProjectTab::PathSelection => {
-                        ui.heading("Sequence");
-                        ui.horizontal(|ui| {
-                            if ui.button("Add all").clicked() {
-                                for (pi, part) in project.parts.iter().enumerate() {
-                                    for ci in 0..part.paths.len() {
-                                        if project.seq_index(pi, ci).is_none() {
-                                            project.sequence.push(SeqItem { part: pi, path: ci, reverse: false });
-                                        }
-                                    }
-                                }
-                            }
-                            if ui.button("Clear").clicked() {
-                                project.sequence.clear();
-                            }
-                        });
-                        ui.label(
-                            RichText::new("Click paths on the bed to add them in order. Click again to remove.")
-                                .small()
-                                .weak(),
-                        );
-                        let mut del: Option<usize> = None;
-                        let mut up: Option<usize> = None;
-                        let mut down: Option<usize> = None;
-                        let n = project.sequence.len();
-                        for i in 0..n {
-                            let item = project.sequence[i];
-                            ui.horizontal(|ui| {
-                                let pname = project.parts.get(item.part).map(|p| p.name.clone()).unwrap_or_default();
-                                ui.label(format!("{:>2}. {} #{}", i + 1, pname, item.path + 1));
-                                if ui.small_button("^").clicked() && i > 0 {
-                                    up = Some(i);
-                                }
-                                if ui.small_button("v").clicked() && i + 1 < n {
-                                    down = Some(i);
-                                }
-                                if ui
-                                    .selectable_label(item.reverse, "rev")
-                                    .on_hover_text("Reverse direction")
-                                    .clicked()
-                                {
-                                    project.sequence[i].reverse = !item.reverse;
-                                }
-                                if ui.small_button("x").clicked() {
-                                    del = Some(i);
-                                }
-                            });
+                    ProjectTab::Gcode => {
+                        ui.heading("G-code");
+                        ui.label(format!("{} lines", gcode.lines().count()));
+                        if ui.button("Save...").clicked() {
+                            actions.push(Action::SaveGcode);
                         }
-                        if let Some(i) = up {
-                            project.sequence.swap(i, i - 1);
+                        if ui.button("Copy to clipboard").clicked() {
+                            ui.ctx().copy_text(gcode.clone());
+                            actions.push(Action::CopyGcode);
                         }
-                        if let Some(i) = down {
-                            project.sequence.swap(i, i + 1);
-                        }
-                        if let Some(i) = del {
-                            project.sequence.remove(i);
-                        }
-                        ui.separator();
-                        ui.add_space(4.0);
-                        if ui
-                            .add_sized([ui.available_width(), 30.0], egui::Button::new(RichText::new("Generate G-code").strong()).fill(theme::ACCENT))
-                            .clicked()
-                        {
-                            actions.push(Action::Generate);
+                        for w in warnings.iter() {
+                            ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
                         }
                     }
                     ProjectTab::Preview => {
@@ -683,35 +676,6 @@ impl App {
                 }
             });
         });
-
-        if *tab == ProjectTab::Prepare && !gcode.is_empty() && *gcode_open {
-            egui::Panel::bottom("gcode_panel")
-                .resizable(true)
-                .default_size(180.0)
-                .show(root, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("G-code");
-                        if ui.button("Save...").clicked() {
-                            actions.push(Action::SaveGcode);
-                        }
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(gcode.clone());
-                            actions.push(Action::CopyGcode);
-                        }
-                        if ui.button("Close").clicked() {
-                            *gcode_open = false;
-                        }
-                        ui.label(format!("{} lines", gcode.lines().count()));
-                    });
-                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut gcode.as_str())
-                                .code_editor()
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-                });
-        }
 
         if *tab == ProjectTab::Preview {
             egui::Panel::bottom("preview_bar").show(root, |ui| {
@@ -764,14 +728,22 @@ impl App {
                         if ui.button("Zoom fit").clicked() {
                             canvas.zoom_fit();
                         }
+                        if *tab == ProjectTab::Prepare {
+                            ui.checkbox(&mut canvas.snap, "Snap")
+                                .on_hover_text("Snap to bed corners, the origin and points of other DXFs while moving. Hold Alt to ignore.");
+                        }
                         let hint = if *tab == ProjectTab::Prepare {
-                            "Drag a part to place it.   Wheel: zoom   Right or middle drag: pan"
+                            "Drag a DXF to place it (Alt: no snap).   Wheel: zoom   Right or middle drag: pan"
                         } else {
-                            "Click paths to build the order.   Wheel: zoom   Right or middle drag: pan"
+                            "DXFs are locked. Click paths to build the order.   Wheel: zoom   Right or middle drag: pan"
                         };
                         ui.label(RichText::new(hint).small().weak());
                     });
+                    let steps = project.sequence.len();
                     canvas.show(ui, project);
+                    if project.sequence.len() != steps {
+                        canvas.sel_steps.clear();
+                    }
                 }
                 ProjectTab::Preview => {
                     ui.horizontal(|ui| {
@@ -789,6 +761,15 @@ impl App {
                         ui.checkbox(&mut preview.show_full, "Whole path");
                     });
                     preview.show(ui, &project.machine);
+                }
+                ProjectTab::Gcode => {
+                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut gcode.as_str())
+                                .code_editor()
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
                 }
             });
     }
@@ -908,6 +889,362 @@ impl App {
             } else if cancel || !open {
                 *rename = None;
             }
+        }
+    }
+}
+
+
+fn job_settings_grid(ui: &mut egui::Ui, j: &mut JobSettings) {
+    egui::Grid::new("job").num_columns(2).show(ui, |ui| {
+        ui.label("Work feed");
+        ui.add(egui::DragValue::new(&mut j.dispense_feed).speed(5.0).range(1.0..=20000.0).suffix(" mm/min"));
+        ui.end_row();
+        ui.label("Travel feed");
+        ui.add(egui::DragValue::new(&mut j.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"));
+        ui.end_row();
+        ui.label("Use Z axis");
+        ui.checkbox(&mut j.use_z, "");
+        ui.end_row();
+        ui.add_enabled_ui(j.use_z, |ui| ui.label("Safe Z"));
+        ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.safe_z).speed(0.1).suffix(" mm"));
+        ui.end_row();
+        ui.add_enabled_ui(j.use_z, |ui| ui.label("Work Z"));
+        ui.add_enabled(j.use_z, egui::DragValue::new(&mut j.dispense_z).speed(0.1).suffix(" mm"));
+        ui.end_row();
+        ui.label("Start delay");
+        ui.add(egui::DragValue::new(&mut j.on_delay_ms).speed(5.0).suffix(" ms"));
+        ui.end_row();
+        ui.label("Stop delay");
+        ui.add(egui::DragValue::new(&mut j.off_delay_ms).speed(5.0).suffix(" ms"));
+        ui.end_row();
+    });
+}
+
+enum AddStep {
+    AllPaths,
+    Home,
+    Goto,
+    Pause,
+    Clear,
+}
+
+fn step_desc(project: &Project, item: &SeqItem) -> String {
+    match item.kind {
+        StepKind::Path => {
+            let name = project.parts.get(item.part).map(|p| p.name.as_str()).unwrap_or("?");
+            format!(
+                "{} #{}{}{}",
+                name,
+                item.path + 1,
+                if item.reverse { "  (reversed)" } else { "" },
+                if item.over.is_empty() { "" } else { "  *" }
+            )
+        }
+        StepKind::Home => "Home".to_string(),
+        StepKind::Goto { x, y, z } => match z {
+            Some(z) => format!("Go to  X{x:.2}  Y{y:.2}  Z{z:.2}"),
+            None => format!("Go to  X{x:.2}  Y{y:.2}"),
+        },
+        StepKind::Pause { ms } => format!("Pause  {ms} ms"),
+    }
+}
+
+/// A row with a tick to override a job value and the value itself.
+fn override_row(ui: &mut egui::Ui, label: &str, ov: &mut Option<f64>, job: f64, speed: f64, suffix: &str, enabled: bool) {
+    ui.add_enabled_ui(enabled, |ui| {
+        let mut on = ov.is_some();
+        if ui.checkbox(&mut on, label).changed() {
+            *ov = if on { Some(job) } else { None };
+        }
+    });
+    match ov {
+        Some(v) if enabled => {
+            ui.add(egui::DragValue::new(v).speed(speed).suffix(suffix));
+        }
+        _ => {
+            ui.label(RichText::new(format!("{job}{suffix}")).weak());
+        }
+    }
+    ui.end_row();
+}
+
+fn step_settings(ui: &mut egui::Ui, item: &mut SeqItem, job: &JobSettings) {
+    ui.set_min_width(250.0);
+    match &mut item.kind {
+        StepKind::Path => {
+            ui.label(RichText::new("Tick a value to change it for this path. Others follow Job settings.").small().weak());
+            let o = &mut item.over;
+            egui::Grid::new("step_over").num_columns(2).show(ui, |ui| {
+                override_row(ui, "Work feed", &mut o.dispense_feed, job.dispense_feed, 5.0, " mm/min", true);
+                override_row(ui, "Travel feed", &mut o.travel_feed, job.travel_feed, 10.0, " mm/min", true);
+                override_row(ui, "Safe Z", &mut o.safe_z, job.safe_z, 0.1, " mm", job.use_z);
+                override_row(ui, "Work Z", &mut o.dispense_z, job.dispense_z, 0.1, " mm", job.use_z);
+                let mut on_ms = o.on_delay_ms.map(|v| v as f64);
+                override_row(ui, "Start delay", &mut on_ms, job.on_delay_ms as f64, 5.0, " ms", true);
+                o.on_delay_ms = on_ms.map(|v| v.max(0.0) as u32);
+                let mut off_ms = o.off_delay_ms.map(|v| v as f64);
+                override_row(ui, "Stop delay", &mut off_ms, job.off_delay_ms as f64, 5.0, " ms", true);
+                o.off_delay_ms = off_ms.map(|v| v.max(0.0) as u32);
+            });
+            if ui.add_enabled(!item.over.is_empty(), egui::Button::new("Use job settings")).clicked() {
+                item.over = JobOverride::default();
+            }
+        }
+        StepKind::Goto { x, y, z } => {
+            egui::Grid::new("step_goto").num_columns(2).show(ui, |ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(x).speed(0.1).suffix(" mm"));
+                ui.end_row();
+                ui.label("Y");
+                ui.add(egui::DragValue::new(y).speed(0.1).suffix(" mm"));
+                ui.end_row();
+                let mut use_z = z.is_some();
+                if ui.checkbox(&mut use_z, "Z").changed() {
+                    *z = if use_z { Some(job.safe_z) } else { None };
+                }
+                match z {
+                    Some(v) => {
+                        ui.add(egui::DragValue::new(v).speed(0.1).suffix(" mm"));
+                    }
+                    None => {
+                        ui.label(RichText::new("stays at safe Z").weak());
+                    }
+                }
+                ui.end_row();
+            });
+        }
+        StepKind::Pause { ms } => {
+            ui.horizontal(|ui| {
+                ui.label("Wait");
+                ui.add(egui::DragValue::new(ms).speed(10.0).range(0..=600_000).suffix(" ms"));
+            });
+        }
+        StepKind::Home => {
+            ui.label("Goes to the home position of the machine.");
+        }
+    }
+}
+
+/// Move the selected steps so the block starts at `ins` (an index into the
+/// list before the move).
+fn move_steps(project: &mut Project, sel: &mut Vec<usize>, ins: usize) {
+    let mut idx = sel.clone();
+    idx.sort_unstable();
+    idx.dedup();
+    idx.retain(|&i| i < project.sequence.len());
+    if idx.is_empty() {
+        return;
+    }
+    let before = idx.iter().filter(|&&i| i < ins).count();
+    let items: Vec<SeqItem> = idx.iter().map(|&i| project.sequence[i]).collect();
+    for &i in idx.iter().rev() {
+        project.sequence.remove(i);
+    }
+    let at = (ins - before).min(project.sequence.len());
+    for (k, it) in items.iter().enumerate() {
+        project.sequence.insert(at + k, *it);
+    }
+    *sel = (at..at + items.len()).collect();
+}
+
+fn sequence_ui(ui: &mut egui::Ui, project: &mut Project, sel: &mut Vec<usize>, drag: &mut Option<usize>) {
+    sel.retain(|&i| i < project.sequence.len());
+    let mut add: Option<AddStep> = None;
+    let mut delete = false;
+
+    ui.horizontal(|ui| {
+        ui.heading("Sequence");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right to left: delete first so it sits right of add.
+            if icons::icon_button_ex(ui, icons::Icon::Trash, "Remove the selected steps (Delete)", false, !sel.is_empty()).clicked() {
+                delete = true;
+            }
+            let plus = icons::icon_button(ui, icons::Icon::Plus, "Add a step");
+            egui::Popup::menu(&plus).show(|ui| {
+                if ui.button("All paths").clicked() {
+                    add = Some(AddStep::AllPaths);
+                }
+                ui.separator();
+                if ui.button("Home").clicked() {
+                    add = Some(AddStep::Home);
+                }
+                if ui.button("Go to coordinate").clicked() {
+                    add = Some(AddStep::Goto);
+                }
+                if ui.button("Pause").clicked() {
+                    add = Some(AddStep::Pause);
+                }
+                ui.separator();
+                if ui.button("Clear sequence").clicked() {
+                    add = Some(AddStep::Clear);
+                }
+            });
+        });
+    });
+    ui.label(
+        RichText::new("Click paths on the bed to add them. Drag rows to reorder. Ctrl or Shift click selects several.")
+            .small()
+            .weak(),
+    );
+
+    // Delete key, when no text field is being edited.
+    if !sel.is_empty() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+        delete = true;
+    }
+
+    // Adding steps.
+    if let Some(a) = add {
+        let at = sel.iter().max().map_or(project.sequence.len(), |m| m + 1).min(project.sequence.len());
+        let home = project.machine.home_position();
+        let new: Vec<SeqItem> = match a {
+            AddStep::AllPaths => {
+                let mut v = vec![];
+                for (pi, part) in project.parts.iter().enumerate() {
+                    for ci in 0..part.paths.len() {
+                        if project.seq_index(pi, ci).is_none() {
+                            v.push(SeqItem::path(pi, ci));
+                        }
+                    }
+                }
+                v
+            }
+            AddStep::Home => vec![SeqItem::other(StepKind::Home)],
+            AddStep::Goto => vec![SeqItem::other(StepKind::Goto { x: home[0], y: home[1], z: None })],
+            AddStep::Pause => vec![SeqItem::other(StepKind::Pause { ms: 1000 })],
+            AddStep::Clear => {
+                project.sequence.clear();
+                sel.clear();
+                vec![]
+            }
+        };
+        let count = new.len();
+        for (k, it) in new.into_iter().enumerate() {
+            project.sequence.insert(at + k, it);
+        }
+        if count > 0 {
+            *sel = (at..at + count).collect();
+        }
+    }
+    if delete {
+        let mut idx = sel.clone();
+        idx.sort_unstable();
+        idx.dedup();
+        for &i in idx.iter().rev() {
+            if i < project.sequence.len() {
+                project.sequence.remove(i);
+            }
+        }
+        sel.clear();
+    }
+
+    // The list.
+    let n = project.sequence.len();
+    let job = project.job.clone();
+    let mut rows: Vec<egui::Rect> = Vec::with_capacity(n);
+    if n == 0 {
+        ui.label(RichText::new("The sequence is empty.").small().weak());
+    }
+    for i in 0..n {
+        let item = project.sequence[i];
+        let desc = step_desc(project, &item);
+        let selected = sel.contains(&i);
+        let bg = ui.painter().add(egui::Shape::Noop);
+        let mut label_rect = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - if item.is_path() { 54.0 } else { 28.0 }).max(40.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
+            label_rect = rect;
+            if resp.drag_started() {
+                *drag = Some(i);
+                if !selected {
+                    sel.clear();
+                    sel.push(i);
+                }
+            }
+            if resp.clicked() {
+                let m = ui.input(|inp| inp.modifiers);
+                if m.shift && !sel.is_empty() {
+                    let anchor = *sel.last().unwrap();
+                    let (lo, hi) = (anchor.min(i), anchor.max(i));
+                    *sel = (lo..=hi).collect();
+                } else if m.command {
+                    if let Some(pos) = sel.iter().position(|&x| x == i) {
+                        sel.remove(pos);
+                    } else {
+                        sel.push(i);
+                    }
+                } else {
+                    sel.clear();
+                    sel.push(i);
+                }
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(if drag.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            }
+            // Grip dots and text.
+            let col = ui.visuals().text_color();
+            let painter = ui.painter().with_clip_rect(rect);
+            for dx in [0.0_f32, 4.0] {
+                for dy in [-4.0_f32, 0.0, 4.0] {
+                    painter.circle_filled(rect.left_center() + egui::vec2(5.0 + dx, dy), 1.1, col.gamma_multiply(0.5));
+                }
+            }
+            painter.text(
+                rect.left_center() + egui::vec2(18.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{:>2}.  {}", i + 1, desc),
+                egui::FontId::proportional(13.0),
+                col,
+            );
+            if item.is_path() {
+                let rev = icons::icon_button_ex(ui, icons::Icon::Reverse, "Reverse direction", item.reverse, true);
+                if rev.clicked() {
+                    project.sequence[i].reverse = !item.reverse;
+                }
+            }
+            if item.kind != StepKind::Home {
+                let b = icons::icon_button_ex(ui, icons::Icon::Settings, "Step settings", !item.over.is_empty(), true);
+                egui::Popup::from_toggle_button_response(&b)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| step_settings(ui, &mut project.sequence[i], &job));
+            }
+        });
+        // Row background spans the whole width.
+        let full = egui::Rect::from_min_max(
+            egui::pos2(ui.min_rect().left(), label_rect.top() - 1.0),
+            egui::pos2(ui.max_rect().right(), label_rect.bottom() + 1.0),
+        );
+        rows.push(full);
+        let fill = if selected {
+            Some(theme::ACCENT.gamma_multiply(0.7))
+        } else if i % 2 == 1 {
+            Some(ui.visuals().faint_bg_color)
+        } else {
+            None
+        };
+        if let Some(f) = fill {
+            ui.painter().set(bg, egui::Shape::rect_filled(full, egui::CornerRadius::same(2), f));
+        }
+    }
+
+    // Drag and drop reordering.
+    if let Some(_from) = *drag {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()) {
+            let ins = rows.iter().position(|r| ptr.y < r.center().y).unwrap_or(n);
+            if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+                let y = if ins < n { rows[ins].top() } else { last.bottom() };
+                ui.painter().line_segment(
+                    [egui::pos2(first.left(), y), egui::pos2(first.right(), y)],
+                    egui::Stroke::new(2.0, theme::PATH_HOVER),
+                );
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                move_steps(project, sel, ins);
+                *drag = None;
+            }
+        } else {
+            *drag = None;
         }
     }
 }
@@ -1048,8 +1385,8 @@ fn speed_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool) {
             .add(egui::DragValue::new(&mut m.job.travel_feed).speed(10.0).range(1.0..=50000.0).suffix(" mm/min"))
             .changed();
         ui.end_row();
-        ui.label("F on rapid moves");
-        *ch |= ui.checkbox(&mut m.gcode.rapid_with_feed, "").changed();
+        ui.label("F on every G0-G3 move");
+        *ch |= ui.checkbox(&mut m.gcode.feed_every_move, "").changed();
         ui.end_row();
     });
 }

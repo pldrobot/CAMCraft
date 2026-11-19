@@ -41,8 +41,9 @@ pub struct GcodeStyle {
     pub dwell: String,
     pub rapid_cmd: String,
     pub linear_cmd: String,
-    /// Add an F word to rapid moves (Marlin needs it, GRBL ignores it).
-    pub rapid_with_feed: bool,
+    /// F word on every G0-G3 line (rapids use the travel feed). Off: only
+    /// where the feed changes.
+    pub feed_every_move: bool,
     pub decimals: usize,
     pub comments: bool,
     /// Write G2/G3 for arcs instead of many short G1 lines.
@@ -57,7 +58,7 @@ impl Default for GcodeStyle {
             dwell: "G4 P{s}".into(),
             rapid_cmd: "G0".into(),
             linear_cmd: "G1".into(),
-            rapid_with_feed: false,
+            feed_every_move: true,
             decimals: 3,
             comments: true,
             arcs: false,
@@ -428,12 +429,18 @@ impl ArcSpan {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Part {
     pub name: String,
     pub paths: Vec<PathData>,
     /// Position of the DXF origin on the bed, in mm.
     pub offset: Pt,
+    /// DXF file the part was imported from, used to change its layers.
+    #[serde(default)]
+    pub source: String,
+    /// Layers imported from the source file.
+    #[serde(default)]
+    pub layers: Vec<String>,
 }
 
 impl Part {
@@ -451,11 +458,78 @@ impl Part {
     }
 }
 
+/// Per-step values that replace the job settings. None keeps the job value.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct JobOverride {
+    pub dispense_feed: Option<f64>,
+    pub travel_feed: Option<f64>,
+    pub safe_z: Option<f64>,
+    pub dispense_z: Option<f64>,
+    pub on_delay_ms: Option<u32>,
+    pub off_delay_ms: Option<u32>,
+}
+
+impl JobOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl JobSettings {
+    /// The job settings with a step's overrides applied.
+    pub fn with(&self, o: &JobOverride) -> JobSettings {
+        JobSettings {
+            dispense_feed: o.dispense_feed.unwrap_or(self.dispense_feed),
+            travel_feed: o.travel_feed.unwrap_or(self.travel_feed),
+            use_z: self.use_z,
+            safe_z: o.safe_z.unwrap_or(self.safe_z),
+            dispense_z: o.dispense_z.unwrap_or(self.dispense_z),
+            on_delay_ms: o.on_delay_ms.unwrap_or(self.on_delay_ms),
+            off_delay_ms: o.off_delay_ms.unwrap_or(self.off_delay_ms),
+        }
+    }
+}
+
+/// What a step of the sequence does.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum StepKind {
+    /// Follow a path of a part.
+    #[default]
+    Path,
+    /// Go to the machine home position.
+    Home,
+    /// Go to a bed coordinate. Z is left alone when None.
+    Goto { x: f64, y: f64, z: Option<f64> },
+    /// Wait.
+    Pause { ms: u32 },
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SeqItem {
+    /// Part and path, used by path steps only.
     pub part: usize,
     pub path: usize,
     pub reverse: bool,
+    #[serde(default)]
+    pub kind: StepKind,
+    /// Job setting overrides of this step.
+    #[serde(default)]
+    pub over: JobOverride,
+}
+
+impl SeqItem {
+    pub fn path(part: usize, path: usize) -> Self {
+        Self { part, path, reverse: false, kind: StepKind::Path, over: JobOverride::default() }
+    }
+
+    pub fn other(kind: StepKind) -> Self {
+        Self { part: 0, path: 0, reverse: false, kind, over: JobOverride::default() }
+    }
+
+    pub fn is_path(&self) -> bool {
+        self.kind == StepKind::Path
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -481,18 +555,23 @@ impl Project {
             return;
         }
         self.parts.remove(idx);
-        self.sequence.retain(|s| s.part != idx);
+        self.sequence.retain(|s| !s.is_path() || s.part != idx);
         for s in &mut self.sequence {
-            if s.part > idx {
+            if s.is_path() && s.part > idx {
                 s.part -= 1;
             }
         }
     }
 
+    /// Drop the sequence entries of a part, e.g. after its paths changed.
+    pub fn clear_part_sequence(&mut self, part: usize) {
+        self.sequence.retain(|s| !s.is_path() || s.part != part);
+    }
+
     pub fn seq_index(&self, part: usize, path: usize) -> Option<usize> {
         self.sequence
             .iter()
-            .position(|s| s.part == part && s.path == path)
+            .position(|s| s.is_path() && s.part == part && s.path == path)
     }
 
     /// Points of a path in bed coordinates, in travel order.

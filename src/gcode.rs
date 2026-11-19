@@ -1,4 +1,4 @@
-use crate::model::{ArcSpan, ControlType, GcodeStyle, Project, Pt};
+use crate::model::{ArcSpan, ControlType, GcodeStyle, Project, Pt, StepKind};
 
 /// One straight piece of the toolpath, for the preview.
 #[derive(Clone, Copy, Debug)]
@@ -103,13 +103,55 @@ pub fn generate(project: &Project) -> GcodeResult {
         out.push(format!("{} Z{}", st.rapid_cmd, num(job.safe_z, d)));
     }
 
-    let rapid_f = if st.rapid_with_feed {
-        format!(" F{}", num(job.travel_feed, 0))
-    } else {
-        String::new()
-    };
-
     for (i, item) in project.sequence.iter().enumerate() {
+        // Job settings of this step: the job values with its overrides.
+        let job_step = project.job.with(&item.over);
+        let job = &job_step;
+        let rapid_f = if st.feed_every_move {
+            format!(" F{}", num(job.travel_feed, 0))
+        } else {
+            String::new()
+        };
+        if job.use_z && (job.dispense_z > travel[2] || job.safe_z > travel[2]) && !item.over.is_empty() {
+            warnings.push(format!("Step {} has a Z above the Z travel of the machine.", i + 1));
+        }
+        let target = match item.kind {
+            StepKind::Path => None,
+            StepKind::Pause { ms } => {
+                comment(&mut out, format!("Step {}: pause {} ms", i + 1, ms));
+                out.push(ee.off_line());
+                if ms > 0 {
+                    out.push(dwell(st, ms));
+                }
+                continue;
+            }
+            StepKind::Home => {
+                comment(&mut out, format!("Step {}: home", i + 1));
+                let h = m.home_position();
+                Some((h[0], h[1], if job.use_z { Some(h[2]) } else { None }))
+            }
+            StepKind::Goto { x, y, z } => {
+                comment(&mut out, format!("Step {}: go to X{} Y{}", i + 1, num(x, d), num(y, d)));
+                Some((x, y, if job.use_z { z } else { None }))
+            }
+        };
+        if let Some((x, y, z)) = target {
+            out.push(ee.off_line());
+            if job.use_z {
+                out.push(format!("{} Z{}{}", st.rapid_cmd, num(job.safe_z, d), rapid_f));
+                let c = cur;
+                push_move(&mut moves, &mut cur, [c[0], c[1], job.safe_z], false);
+            }
+            out.push(format!("{} X{} Y{}{}", st.rapid_cmd, num(x, d), num(y, d), rapid_f));
+            let c = cur;
+            push_move(&mut moves, &mut cur, [x, y, c[2]], false);
+            if let Some(z) = z {
+                out.push(format!("{} Z{}{}", st.rapid_cmd, num(z, d), rapid_f));
+                let c = cur;
+                push_move(&mut moves, &mut cur, [c[0], c[1], z], false);
+            }
+            continue;
+        }
         if item.part >= project.parts.len()
             || item.path >= project.parts[item.part].paths.len()
         {
@@ -158,7 +200,7 @@ pub fn generate(project: &Project) -> GcodeResult {
         }
         let mut k = 1;
         while k < pts.len() {
-            let f = if k == 1 && !job.use_z {
+            let f = if st.feed_every_move || (k == 1 && !job.use_z) {
                 format!(" F{}", num(job.dispense_feed, 0))
             } else {
                 String::new()
@@ -221,6 +263,7 @@ pub fn generate(project: &Project) -> GcodeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::StepKind;
     use crate::model::*;
 
     fn sample() -> Project {
@@ -239,8 +282,9 @@ mod tests {
                 arcs: vec![],
             }],
             offset: [20.0, 30.0],
+            ..Default::default()
         });
-        p.sequence.push(SeqItem { part: 0, path: 0, reverse: false });
+        p.sequence.push(SeqItem::path(0, 0));
         p
     }
 
@@ -248,16 +292,34 @@ mod tests {
     fn grbl_output() {
         let r = generate(&sample());
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        assert!(r.text.contains("G0 X20 Y30\n"));
+        assert!(r.text.contains("G0 X20 Y30 F3000\n"));
         assert!(r.text.contains("M8\nG4 P0.2\n"));
-        assert!(r.text.contains("G1 X20 Y30\n")); // closed path returns to start
+        assert!(r.text.contains("G1 X20 Y30 F300\n")); // closed path returns to start
         assert!(r.text.trim_end().ends_with("M9\nM30"));
+    }
+
+    #[test]
+    fn steps_and_per_path_overrides() {
+        let mut p = sample();
+        p.sequence[0].over.dispense_feed = Some(120.0);
+        p.sequence.insert(0, SeqItem::other(StepKind::Goto { x: 50.0, y: 60.0, z: None }));
+        p.sequence.push(SeqItem::other(StepKind::Pause { ms: 750 }));
+        p.sequence.push(SeqItem::other(StepKind::Home));
+        let r = generate(&p);
+        assert!(r.text.contains("G0 X50 Y60 F3000
+"), "{}", r.text);
+        assert!(r.text.contains("G1 X30 Y30 F120
+"), "{}", r.text);
+        assert!(r.text.contains("G4 P0.75
+"), "{}", r.text);
+        assert!(r.text.contains("G0 X0 Y0 F3000
+"), "{}", r.text);
     }
 
     #[test]
     fn rapid_feed_and_ms_dwell() {
         let mut p = sample();
-        p.machine.gcode.rapid_with_feed = true;
+        p.machine.gcode.feed_every_move = true;
         p.machine.gcode.dwell = "G4 P{ms}".into();
         let r = generate(&p);
         assert!(r.text.contains("M8\nG4 P200\n"));
@@ -290,7 +352,7 @@ mod tests {
         p.sequence[0].reverse = true;
         p.parts[0].offset = [120.0, 30.0];
         let r = generate(&p);
-        assert!(r.text.contains("G0 X120 Y30\n"));
+        assert!(r.text.contains("G0 X120 Y30 F3000\n"));
         assert!(r.warnings.iter().any(|w| w.contains("outside the workable area")));
     }
 
@@ -327,13 +389,22 @@ mod tests {
         let mut p = circle_project();
         p.machine.gcode.arcs = true;
         let r = generate(&p);
-        assert!(r.text.contains("G3 X0 Y10 I-10 J0\n"), "{}", r.text);
+        assert!(r.text.contains("G3 X0 Y10 I-10 J0 F300\n"), "{}", r.text);
         assert_eq!(r.text.matches("G3 X").count(), 2);
         assert_eq!(r.text.matches("G1 X").count(), 0);
         p.sequence[0].reverse = true;
         let r = generate(&p);
         assert_eq!(r.text.matches("G2 X").count(), 2, "{}", r.text);
-        assert!(r.text.contains("G2 X0 Y10 I-10 J0\n"), "{}", r.text);
+        assert!(r.text.contains("G2 X0 Y10 I-10 J0 F300\n"), "{}", r.text);
+    }
+
+    #[test]
+    fn feed_every_move_option() {
+        let mut p = sample();
+        let n = |p: &Project| generate(p).text.lines().filter(|l| l.starts_with("G1 X") && l.contains(" F")).count();
+        let all = n(&p);
+        p.machine.gcode.feed_every_move = false;
+        assert!(n(&p) < all, "{all}");
     }
 
     #[test]
@@ -456,8 +527,9 @@ mod home_tests {
             name: "sq".into(),
             paths: vec![PathData { pts: vec![[0.0, 0.0], [10.0, 0.0]], closed: false, arcs: vec![] }],
             offset: [20.0, 30.0],
+            ..Default::default()
         });
-        p.sequence.push(SeqItem { part: 0, path: 0, reverse: false });
+        p.sequence.push(SeqItem::path(0, 0));
         let r = generate(&p);
         assert_eq!(r.moves[0].from, [5.0, 0.0, 20.0]);
     }
