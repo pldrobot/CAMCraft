@@ -3,6 +3,7 @@ mod dxf_import;
 mod gcode;
 mod icons;
 mod model;
+mod p3d;
 mod preview;
 mod theme;
 
@@ -13,6 +14,12 @@ use model::*;
 use preview::Preview;
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+#[derive(PartialEq, Clone, Copy)]
+enum NewKind {
+    D2,
+    D3,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -77,6 +84,10 @@ struct App {
     pending_dxf: Option<PendingDxf>,
     /// Sequence step being dragged to a new place.
     seq_drag: Option<usize>,
+    /// Kind of project chosen in the New Project window.
+    new_kind: NewKind,
+    /// The open 3D project. Only one of `project` and `p3` is Some.
+    p3: Option<p3d::ui::P3App>,
 }
 
 impl App {
@@ -102,6 +113,8 @@ impl App {
             preview: Preview::default(),
             pending_dxf: None,
             seq_drag: None,
+            new_kind: NewKind::D2,
+            p3: None,
         }
     }
 
@@ -121,16 +134,31 @@ impl App {
             }
             Action::OpenProject => {
                 let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CAMCraft project", &["camcraft"])
+                    .add_filter("CAMCraft project", &["camcraft", "camcraft3d"])
+                    .add_filter("2D project", &["camcraft"])
+                    .add_filter("3D project", &["camcraft3d"])
                     .pick_file()
                 else {
                     return;
                 };
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("camcraft3d")) {
+                    match p3d::ui::P3App::open(path) {
+                        Ok(app) => {
+                            self.p3 = Some(app);
+                            self.project = None;
+                            self.project_path = None;
+                            self.screen = Screen::Project;
+                        }
+                        Err(e) => self.say(format!("Open failed: {e}")),
+                    }
+                    return;
+                }
                 match std::fs::read_to_string(&path)
                     .map_err(|e| e.to_string())
                     .and_then(|s| serde_json::from_str::<Project>(&s).map_err(|e| e.to_string()))
                 {
                     Ok(p) => {
+                        self.p3 = None;
                         self.project = Some(p);
                         self.project_path = Some(path.clone());
                         self.canvas = Canvas::default();
@@ -145,10 +173,14 @@ impl App {
                 }
             }
             Action::SaveProject(as_new) => {
+                if let Some(p3) = &mut self.p3 {
+                    p3.save(as_new);
+                    return;
+                }
                 let Some(project) = &self.project else { return };
                 let path = if as_new || self.project_path.is_none() {
                     rfd::FileDialog::new()
-                        .add_filter("CAMCraft project", &["camcraft"])
+                        .add_filter("CAMCraft 2D project", &["camcraft"])
                         .set_file_name("project.camcraft")
                         .save_file()
                 } else {
@@ -366,7 +398,7 @@ impl App {
                         actions.push(Action::OpenProject);
                         ui.close();
                     }
-                    ui.add_enabled_ui(self.project.is_some(), |ui| {
+                    ui.add_enabled_ui(self.project.is_some() || self.p3.is_some(), |ui| {
                         if ui.button("Save").clicked() {
                             actions.push(Action::SaveProject(false));
                             ui.close();
@@ -391,7 +423,11 @@ impl App {
     fn status_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::bottom("status").show(root, |ui| {
             ui.horizontal(|ui| {
-                let coords = match (self.screen, self.canvas.cursor_world) {
+                let cursor = match &self.p3 {
+                    Some(p3) => p3.cursor,
+                    None => self.canvas.cursor_world,
+                };
+                let coords = match (self.screen, cursor) {
                     (Screen::Project, Some(p)) => format!("X {:8.2}   Y {:8.2}", p[0], p[1]),
                     _ => "X          Y".to_string(),
                 };
@@ -422,6 +458,14 @@ impl App {
                     }
                 } else {
                     self.new_machine_idx = self.new_machine_idx.min(self.lib.machines.len() - 1);
+                    ui.label("Project type");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.new_kind, NewKind::D2, "2D Project")
+                            .on_hover_text("DXF drawings. Flat paths.");
+                        ui.selectable_value(&mut self.new_kind, NewKind::D3, "3D Project")
+                            .on_hover_text("STEP models. Edges as paths, Z gap from a surface.");
+                    });
+                    ui.add_space(4.0);
                     ui.label("Select machine");
                     egui::ComboBox::from_id_salt("new_machine")
                         .selected_text(self.lib.machines[self.new_machine_idx].name.clone())
@@ -446,6 +490,16 @@ impl App {
         }
         if create {
             let m = self.lib.machines[self.new_machine_idx].clone();
+            if self.new_kind == NewKind::D3 {
+                self.p3 = Some(p3d::ui::P3App::new(m.clone()));
+                self.project = None;
+                self.project_path = None;
+                self.screen = Screen::Project;
+                self.show_new = false;
+                self.say(format!("New 3D project on {} ({} x {} x {} mm)", m.name, m.bed_x, m.bed_y, m.bed_z));
+                return;
+            }
+            self.p3 = None;
             self.project = Some(Project::new(m.clone()));
             self.project_path = None;
             self.canvas = Canvas::default();
@@ -455,7 +509,7 @@ impl App {
             self.tab = ProjectTab::Prepare;
             self.screen = Screen::Project;
             self.show_new = false;
-            self.say(format!("New project on {} ({} x {} mm)", m.name, m.bed_x, m.bed_y));
+            self.say(format!("New 2D project on {} ({} x {} mm)", m.name, m.bed_x, m.bed_y));
         }
         if !open {
             self.show_new = false;
@@ -463,6 +517,14 @@ impl App {
     }
 
     fn project_screen(&mut self, root: &mut egui::Ui, actions: &mut Vec<Action>) {
+        if let Some(p3) = &mut self.p3 {
+            p3.show(root, &self.lib);
+            let msgs = std::mem::take(&mut p3.msgs);
+            for m in msgs {
+                self.say(m);
+            }
+            return;
+        }
         if self.project.is_none() {
             egui::CentralPanel::default().show(root, |ui| {
                 ui.vertical_centered(|ui| {
