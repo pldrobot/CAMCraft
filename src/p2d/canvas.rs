@@ -1,5 +1,6 @@
-use crate::model::{PathData, Project, Pt, SeqItem, StepKind};
-use crate::theme::*;
+use super::model::{PathData, Project, SeqItem, StepKind};
+use crate::common::machine::Pt;
+use crate::common::theme::*;
 use eframe::egui;
 use egui::{Align2, Color32, CornerRadius, FontId, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 

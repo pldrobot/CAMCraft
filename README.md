@@ -27,3 +27,12 @@ LINE, LWPOLYLINE, POLYLINE (with bulges), ARC, CIRCLE, SPLINE. Arcs and splines 
 ## Status
 
 Version 0.1. Unit tests cover DXF chaining, circles, bulge arcs, splines and G-code output. The GUI starts and renders under a virtual display, but canvas interaction (drag, click-to-sequence) and generated G-code have not been run on a real machine. Dry-run every file with the valve disconnected first.
+
+## Source layout
+
+    src/app      top-level window, menus, New/Open/Save
+    src/common   machines, toolpath moves, preview, icons, theme (shared by 2D and 3D)
+    src/p2d      2D project: DXF import, canvas, sequence, G-code
+    src/p3d      3D project: STEP import, view, G-code
+
+Build scripts are in scripts/, notes in docs/.

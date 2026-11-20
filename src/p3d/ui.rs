@@ -5,10 +5,10 @@ use super::gcode;
 use super::model::*;
 use super::step::{self, ImportJob, V3};
 use super::view::{Overlay, PickMode, StepViz, View3};
-use crate::icons;
-use crate::model::{AxisOwner, ControlType, JobSettings, Library};
-use crate::preview::{self, Preview};
-use crate::theme;
+use crate::common::icons;
+use crate::common::machine::{AxisOwner, ControlType, JobSettings, Library};
+use crate::common::preview::{self, Preview};
+use crate::common::theme;
 use eframe::egui;
 use egui::{Color32, RichText};
 use std::collections::hash_map::DefaultHasher;
@@ -65,7 +65,7 @@ enum AddStep {
 }
 
 impl P3App {
-    pub fn new(machine: crate::model::Machine) -> Self {
+    pub fn new(machine: crate::common::machine::Machine) -> Self {
         Self::from_project(Project3::new(machine))
     }
 

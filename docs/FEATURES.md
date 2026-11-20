@@ -18,7 +18,7 @@ Use this file as the working checklist in VS Code. Tick items as you finish them
 | `src/model.rs` | GcodeStyle, Machine, Project, Part, PathData, library storage (JSON) |
 | `src/dxf_import.rs` | DXF to paths: flatten arcs and splines, join touching entities |
 | `src/gcode.rs` | Machine-driven G-code generator (has unit tests) |
-| `src/canvas.rs` | Bed view: grid, zoom, pan, drag part, click to sequence |
+| `src/p2d/canvas.rs` | Bed view: grid, zoom, pan, drag part, click to sequence |
 | `src/theme.rs` | AutoCAD-style dark colours |
 
 ## Done in v0.1
@@ -90,7 +90,7 @@ Use this file as the working checklist in VS Code. Tick items as you finish them
 
 ## Prompts to paste into Claude Code (VS Code)
 
-- "Read FEATURES.md and src/canvas.rs. Add undo and redo for part move, sequence changes and part delete."
+- "Read FEATURES.md and src/p2d/canvas.rs. Add undo and redo for part move, sequence changes and part delete."
 - "Add G2/G3 arc output as a flavor option. Keep the existing G1 output as the default and add tests."
 - "Add auto-sequence (nearest neighbour from the origin) as a button next to Add all, with a test."
 - "Add DXF unit detection from $INSUNITS with a manual override in the Insert DXF flow."

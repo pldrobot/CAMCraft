@@ -1,13 +1,6 @@
-use crate::model::{ArcSpan, ControlType, GcodeStyle, Project, Pt, StepKind};
-
-/// One straight piece of the toolpath, for the preview.
-#[derive(Clone, Copy, Debug)]
-pub struct Move {
-    pub from: [f64; 3],
-    pub to: [f64; 3],
-    /// True while the end effector is on.
-    pub work: bool,
-}
+use super::model::{ArcSpan, Project, StepKind};
+use crate::common::machine::{ControlType, GcodeStyle, Pt};
+use crate::common::toolpath::Move;
 
 pub struct GcodeResult {
     pub text: String,
@@ -263,8 +256,9 @@ pub fn generate(project: &Project) -> GcodeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::StepKind;
-    use crate::model::*;
+    use crate::p2d::model::StepKind;
+    use crate::common::machine::*;
+    use crate::p2d::model::*;
 
     fn sample() -> Project {
         let mut machine = Machine::new("Test");
@@ -426,7 +420,7 @@ mod tests {
 
 #[cfg(test)]
 mod workable_tests {
-    use crate::model::*;
+    use crate::common::machine::*;
 
     /// X and Y move the bed, Z moves the end effector: the example machine.
     fn example() -> Machine {
@@ -512,7 +506,8 @@ mod workable_tests {
 #[cfg(test)]
 mod home_tests {
     use super::*;
-    use crate::model::*;
+    use crate::common::machine::*;
+    use crate::p2d::model::*;
 
     #[test]
     fn home_defaults_and_first_move_starts_at_home() {

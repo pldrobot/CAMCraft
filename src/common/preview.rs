@@ -1,8 +1,8 @@
 //! 3D toolpath simulation (Preview tab). Software projection on the egui
 //! painter, so it needs no extra graphics dependency.
 
-use crate::gcode::Move;
-use crate::model::{AxisOwner, EffectorKind, JobSettings, Machine};
+use crate::common::toolpath::Move;
+use crate::common::machine::{AxisOwner, EffectorKind, JobSettings, Machine};
 use eframe::egui;
 use egui::{Align2, Color32, FontId, PointerButton, Pos2, Sense, Shape, Stroke, Ui, Vec2};
 
@@ -297,7 +297,7 @@ impl Preview {
         } else {
             Color32::from_rgb(0x22, 0x29, 0x31)
         };
-        painter.add(Shape::convex_polygon(top_face, top_fill, Stroke::new(1.5, crate::theme::BED_EDGE)));
+        painter.add(Shape::convex_polygon(top_face, top_fill, Stroke::new(1.5, crate::common::theme::BED_EDGE)));
         if schematic {
             // Transparent bed block: the four sides.
             let side_fill = Color32::from_rgba_unmultiplied(0x3f, 0xc1, 0x6b, 50);
@@ -487,7 +487,7 @@ impl Preview {
             let mut x = rect.left() + 10.0;
             for (label, col) in [
                 ("Machine", Color32::from_rgb(0x96, 0xaa, 0xbe)),
-                ("Bed", crate::theme::BED_EDGE),
+                ("Bed", crate::common::theme::BED_EDGE),
                 ("Workable", Color32::from_rgb(0x4f, 0xb6, 0xff)),
                 ("Home", Color32::from_rgb(0xff, 0xdc, 0x3c)),
             ] {

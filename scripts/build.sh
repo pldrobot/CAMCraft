@@ -4,7 +4,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project="$script_dir"
+project="$(dirname "$script_dir")"
 manifest="$project/Cargo.toml"
 
 profile="release"

@@ -1,7 +1,7 @@
 //! Data of a 3D project and the path maths (surface Z gap, tool compensation).
 
 use super::step::{self, Geometry, V3};
-use crate::model::Machine;
+use crate::common::machine::Machine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

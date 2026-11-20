@@ -2,8 +2,8 @@
 
 use super::model::{Kind3, Project3};
 use super::step::V3;
-use crate::gcode::Move;
-use crate::model::ControlType;
+use crate::common::toolpath::Move;
+use crate::common::machine::ControlType;
 
 pub struct Result3 {
     pub text: String,

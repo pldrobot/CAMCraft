@@ -1,6 +1,6 @@
 //! Small painted icon buttons, so they do not depend on font glyphs.
 
-use crate::theme;
+use crate::common::theme;
 use eframe::egui;
 use egui::{Pos2, Response, Sense, Shape, Stroke, Ui, Vec2};
 

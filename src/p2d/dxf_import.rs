@@ -1,4 +1,5 @@
-use crate::model::{ArcSpan, PathData, Pt};
+use super::model::{ArcSpan, PathData};
+use crate::common::machine::Pt;
 use dxf::entities::EntityType;
 use dxf::Drawing;
 use std::collections::{BTreeMap, HashSet};

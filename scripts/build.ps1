@@ -17,7 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$project = $PSScriptRoot
+$project = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $project 'Cargo.toml'
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
