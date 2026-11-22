@@ -9,7 +9,9 @@ use eframe::egui;
 use egui::{Color32, RichText};
 use std::path::PathBuf;
 
+mod prefs;
 mod recent;
+mod settings;
 mod thumb;
 mod welcome;
 
@@ -47,8 +49,7 @@ pub(crate) enum Screen {
 pub(crate) enum ProjectTab {
     Prepare,
     PathSelection,
-    Preview,
-    Gcode,
+    Run,
 }
 
 pub(crate) enum Action {
@@ -104,6 +105,11 @@ pub(crate) struct App {
     pub(crate) thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
     /// The welcome window was closed with its X.
     pub(crate) welcome_closed: bool,
+    pub(crate) settings: settings::Settings,
+    pub(crate) prefs: prefs::Prefs,
+    pub(crate) input: crate::common::controls::Input,
+    /// Jog and run requests from keyboard and gamepad this frame.
+    pub(crate) cmds: Vec<crate::common::controls::Cmd>,
 }
 
 
@@ -147,6 +153,10 @@ impl App {
             logo,
             thumbs: Default::default(),
             welcome_closed: false,
+            settings: settings::Settings::load(),
+            prefs: prefs::Prefs::default(),
+            input: Default::default(),
+            cmds: vec![],
         }
     }
 
@@ -305,6 +315,20 @@ impl App {
                 let r = gcode::generate(project);
                 let lines = r.text.lines().count();
                 self.preview.set_moves(r.moves, &project.job);
+                self.preview.outlines = project
+                    .parts
+                    .iter()
+                    .flat_map(|part| {
+                        part.paths.iter().map(move |pd| {
+                            let mut o: Vec<[f64; 3]> =
+                                pd.pts.iter().map(|p| [p[0] + part.offset[0], p[1] + part.offset[1], 0.0]).collect();
+                            if pd.closed {
+                                o.extend(o.first().copied());
+                            }
+                            o
+                        })
+                    })
+                    .collect();
                 self.gcode = r.text;
                 self.warnings = r.warnings;
                         self.say(format!("G-code generated: {lines} lines, {} warning(s).", self.warnings.len()));
@@ -374,6 +398,12 @@ impl App {
                     ui.separator();
                     if ui.button("Exit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Preferences...").clicked() {
+                        self.prefs.open = true;
+                        ui.close();
                     }
                 });
                 ui.separator();
@@ -469,6 +499,8 @@ impl eframe::App for App {
         }
         let mut actions: Vec<Action> = vec![];
 
+        // Keys are not jog commands while a preferences key is being captured.
+        self.cmds = if self.prefs.capture.is_some() { vec![] } else { self.input.poll(&ctx, &self.settings.controls) };
         self.top_bar(root, &mut actions);
         self.status_bar(root);
         match self.screen {
@@ -477,6 +509,9 @@ impl eframe::App for App {
         }
         self.welcome_window(&ctx, &mut actions);
         self.layer_window(&ctx);
+        if self.prefs.show(&ctx, &mut self.settings) {
+            self.settings.save();
+        }
 
         for a in actions {
             self.run(a);

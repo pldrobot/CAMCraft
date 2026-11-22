@@ -19,8 +19,7 @@ use std::path::PathBuf;
 enum Tab {
     Prepare,
     PathSelection,
-    Preview,
-    Gcode,
+    Run,
 }
 
 pub struct P3App {
@@ -33,8 +32,10 @@ pub struct P3App {
     selected_body: Option<usize>,
     sel_steps: Vec<usize>,
     seq_drag: Option<usize>,
-    /// Prepare: the next click on a face lays it on the bed.
+    /// Prepare, mate: clicking faces. First the face to move, then what it
+    /// mates to (a face of another part or a workspace surface).
     lay_face: bool,
+    mate_first: Option<(usize, usize)>,
     /// Angle of the rotate buttons, degrees.
     rot_step: f64,
     gcode: String,
@@ -80,6 +81,7 @@ impl P3App {
             sel_steps: vec![],
             seq_drag: None,
             lay_face: false,
+            mate_first: None,
             rot_step: 90.0,
             gcode: String::new(),
             warnings: vec![],
@@ -244,29 +246,41 @@ impl P3App {
             .collect();
     }
 
-    pub fn show(&mut self, root: &mut egui::Ui, lib: &Library) {
+    fn save_gcode(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "gc"]).set_file_name("job.gcode").save_file() else {
+            return;
+        };
+        match std::fs::write(&path, &self.gcode) {
+            Ok(()) => self.msgs.push(format!("Saved {}", path.display())),
+            Err(e) => self.msgs.push(format!("Save failed: {e}")),
+        }
+    }
+
+    pub fn show(&mut self, root: &mut egui::Ui, lib: &Library, ctl: &crate::common::controls::Controls, cmds: &[crate::common::controls::Cmd]) {
         self.poll_jobs();
         if !self.jobs.is_empty() {
             root.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.refresh_viz();
         let generated = self.preview.has_path();
-        if matches!(self.tab, Tab::Preview | Tab::Gcode) && !generated {
+        if self.tab == Tab::Run && !generated {
             self.tab = Tab::Prepare;
         }
 
         let mut generate = false;
         egui::Panel::left("p3_left").resizable(false).exact_size(330.0).show(root, |ui| {
-            const ORDER: [Tab; 4] = [Tab::Prepare, Tab::PathSelection, Tab::Preview, Tab::Gcode];
+            const ORDER: [Tab; 3] = [Tab::Prepare, Tab::PathSelection, Tab::Run];
             let cur = ORDER.iter().position(|t| *t == self.tab).unwrap_or(0);
             let picked = icons::tab_strip(ui, &[
                 (icons::Icon::TabPrepare, "Prepare", true),
                 (icons::Icon::TabPath, "Path selection", true),
-                (icons::Icon::TabSimulation, "Simulation", generated),
-                (icons::Icon::TabGcode, "G-code", generated),
+                (icons::Icon::TabSimulation, "Run", generated),
             ], cur);
             if let Some(i) = picked {
                 self.tab = ORDER[i];
+            }
+            if self.tab == Tab::Run && self.preview.machine_mode {
+                preview::console_panel(ui, &mut self.preview);
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
               self.jobs_ui(ui);
@@ -289,31 +303,11 @@ impl P3App {
                         ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
                     }
                 }
-                Tab::Gcode => {
-                    ui.heading("G-code");
-                    ui.label(format!("{} lines", self.gcode.lines().count()));
-                    if ui.button("Save...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("G-code", &["gcode", "nc", "gc"])
-                            .set_file_name("job.gcode")
-                            .save_file()
-                        {
-                            match std::fs::write(&path, &self.gcode) {
-                                Ok(()) => self.msgs.push(format!("Saved {}", path.display())),
-                                Err(e) => self.msgs.push(format!("Save failed: {e}")),
-                            }
-                        }
-                    }
-                    if ui.button("Copy to clipboard").clicked() {
-                        ui.ctx().copy_text(self.gcode.clone());
-                    }
-                    for w in &self.warnings {
-                        ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
-                    }
-                }
-                Tab::Preview => {
+                Tab::Run => {
                     let m = &self.project.machine;
-                    ui.heading("Simulation");
+                    ui.heading("Run");
+                    preview::run_controls(ui, &mut self.preview, &self.project.machine, ctl, cmds, &self.gcode);
+                    ui.separator();
                     egui::Grid::new("p3_pv").num_columns(2).show(ui, |ui| {
                         ui.label("Machine");
                         ui.label(&m.name);
@@ -338,9 +332,6 @@ impl P3App {
                         ui.label(format!("X {}  Y {}  Z {}", own(0), own(1), own(2)));
                         ui.end_row();
                     });
-                    for w in &self.warnings {
-                        ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
-                    }
                 }
               }
             });
@@ -349,48 +340,20 @@ impl P3App {
             self.generate(lib);
         }
 
-        if self.tab == Tab::Preview {
-            egui::Panel::bottom("p3_pv_bar").show(root, |ui| {
-                let total = self.preview.total_time();
-                let pv = &mut self.preview;
-                ui.horizontal(|ui| {
-                    let label = if pv.playing { "Pause" } else if pv.time >= total { "Replay" } else { "Play" };
-                    if ui.button(label).clicked() {
-                        if pv.playing {
-                            pv.playing = false;
-                        } else {
-                            if pv.time >= total {
-                                pv.time = 0.0;
-                            }
-                            pv.playing = true;
-                        }
-                    }
-                    if ui.button("Reset").clicked() {
-                        pv.time = 0.0;
-                        pv.playing = false;
-                    }
-                    ui.spacing_mut().slider_width = (ui.available_width() - 260.0).max(100.0);
-                    let mut t = pv.time;
-                    if ui.add(egui::Slider::new(&mut t, 0.0..=total.max(0.001)).show_value(false)).changed() {
-                        pv.time = t;
-                        pv.playing = false;
-                    }
-                    ui.monospace(format!("{} / {}", preview::fmt_time(pv.time), preview::fmt_time(total)));
-                    egui::ComboBox::from_id_salt("p3_pv_speed")
-                        .width(60.0)
-                        .selected_text(format!("{}x", preview::SPEEDS[pv.speed_idx]))
-                        .show_ui(ui, |ui| {
-                            for (i, s) in preview::SPEEDS.iter().enumerate() {
-                                ui.selectable_value(&mut pv.speed_idx, i, format!("{s}x"));
-                            }
-                        });
-                });
+        if self.tab == Tab::Run {
+            egui::Panel::right("p3_gcode_right").default_size(320.0).show(root, |ui| {
+                match crate::common::gcode_panel::show(ui, &self.gcode, self.preview.current_line()) {
+                    Some(crate::common::gcode_panel::Tool::Save) => self.save_gcode(),
+                    Some(crate::common::gcode_panel::Tool::Copy) => ui.ctx().copy_text(self.gcode.clone()),
+                    None => {}
+                }
             });
         }
 
-        let Self { project, view, tab, pick, selected_body, sel_steps, viz, preview, gcode, cursor, msgs, lay_face, .. } = self;
+        let Self { project, view, tab, pick, selected_body, sel_steps, viz, preview, cursor, msgs, lay_face, mate_first, .. } = self;
         let mut edge_click = None;
         let mut face_click = None;
+        let mut wall_click = None;
         let mut point_click = None;
         if *tab != Tab::PathSelection {
             *pick = None;
@@ -413,8 +376,7 @@ impl P3App {
                     }
                     if *tab == Tab::Prepare {
                         ui.separator();
-                        ui.toggle_value(lay_face, "Lay face on bed")
-                            .on_hover_text("Click a flat face of a part to turn it down onto the bed, like in 3D printing software.");
+                        mate_button(ui, lay_face, mate_first);
                     }
                     if *tab == Tab::PathSelection {
                         ui.separator();
@@ -431,7 +393,11 @@ impl P3App {
                         }
                     }
                     let hint = if *tab == Tab::Prepare && *lay_face {
-                        "Click a flat face to lay it on the bed."
+                        if mate_first.is_some() {
+                            "Now click a face of another part, or a surface of the workspace (the green box), to mate it to."
+                        } else {
+                            "Click the flat face to move."
+                        }
                     } else if *tab == Tab::Prepare {
                         "Drag a part to place it on the bed.   Drag empty space: orbit   Right drag: pan   Wheel: zoom"
                     } else {
@@ -450,11 +416,11 @@ impl P3App {
                         })
                         .collect()
                 } else {
-                    vec![]
+                    mate_first.map(|f| (f, [60, 200, 216])).into_iter().collect()
                 };
                 let ov = Overlay {
                     mode: if *tab == Tab::Prepare {
-                        if *lay_face { PickMode::LayFace } else { PickMode::Move }
+                        if !*lay_face { PickMode::Move } else if mate_first.is_some() { PickMode::MateTarget } else { PickMode::LayFace }
                     } else {
                         match pick.map(|p| p.1) {
                             Some(Target::Path) => PickMode::Edges,
@@ -468,10 +434,14 @@ impl P3App {
                     steps: viz,
                     show_steps: *tab == Tab::PathSelection,
                     sel_steps,
+                    run: None,
                 };
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     *pick = None;
                     *lay_face = false;
+                }
+                if !*lay_face {
+                    *mate_first = None;
                 }
                 let out = view.show(ui, project, &ov);
                 *cursor = out.cursor;
@@ -480,42 +450,74 @@ impl P3App {
                 }
                 edge_click = out.edge_click;
                 face_click = out.face_click;
+                wall_click = out.wall_click;
                 point_click = out.point_click;
             }
-            Tab::Preview => {
+            Tab::Run => {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
+                    if ui.button("Fit").clicked() {
+                        view.fit();
+                    }
                     if ui.button("Iso").clicked() {
-                        preview.view_iso();
+                        view.iso();
                     }
                     if ui.button("Top").clicked() {
-                        preview.view_top();
+                        view.top();
                     }
                     if ui.button("Front").clicked() {
-                        preview.view_front();
+                        view.front();
                     }
                     ui.checkbox(&mut preview.show_travel, "Travel moves");
                     ui.checkbox(&mut preview.show_full, "Whole path");
                 });
-                preview.show(ui, &project.machine);
-            }
-            Tab::Gcode => {
-                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut gcode.as_str()).code_editor().desired_width(f32::INFINITY));
-                });
+                preview.tick(ui.ctx());
+                // Same view as Prepare and Path selection, with the run drawn on top.
+                let ov = Overlay {
+                    mode: PickMode::Idle,
+                    selected_body: None,
+                    tints: &[],
+                    steps: &[],
+                    show_steps: false,
+                    sel_steps: &[],
+                    run: Some(&*preview),
+                };
+                view.show(ui, project, &ov);
             }
         });
 
         // Clicks in the view.
-        if let (Some(f), Tab::Prepare) = (face_click, *tab) {
-            if let Some(b) = project.bodies.get_mut(f.0) {
-                match b.lay_face_down(f.1) {
+        if *tab == Tab::Prepare && *lay_face && (face_click.is_some() || wall_click.is_some()) {
+            if let Some(first) = *mate_first {
+                // Second click: what to mate to.
+                let to = match (face_click, wall_click) {
+                    (Some((tb, _)), _) if tb == first.0 => Err("Pick a face of another part.".to_string()),
+                    (Some((tb, tf)), _) => Ok(MateTo::Face(tb, tf)),
+                    (None, Some(w)) => Ok(MateTo::Wall(w)),
+                    _ => unreachable!(),
+                };
+                let res = to.and_then(|to| {
+                    project.mates.push(Mate { body: first.0, face: first.1, to, flip: false });
+                    let i = project.mates.len() - 1;
+                    project.apply_mate(i).inspect_err(|_| {
+                        project.mates.pop();
+                    })
+                });
+                match res {
                     Ok(()) => {
-                        msgs.push(format!("{}: face laid on the bed.", b.name));
+                        msgs.push(format!("{}: face mated.", project.bodies[first.0].name));
                         *lay_face = false;
-                        *selected_body = Some(f.0);
+                        *mate_first = None;
+                        *selected_body = Some(first.0);
                     }
                     Err(e) => msgs.push(e),
+                }
+            } else if let Some(f) = face_click {
+                // First click: the face to move. It must be flat.
+                match project.bodies.get(f.0).map(|b| b.face_plane(f.1)) {
+                    Some(Ok(_)) => *mate_first = Some(f),
+                    Some(Err(e)) => msgs.push(e),
+                    None => {}
                 }
             }
         } else if let Some((si, t)) = *pick {
@@ -664,6 +666,37 @@ impl P3App {
             self.selected_body = None;
             self.sel_steps.clear();
         }
+        // Mates.
+        if !self.project.mates.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Mates").strong());
+            let (mut flip, mut del) = (None, None);
+            for (i, m) in self.project.mates.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let name = self.project.bodies.get(m.body).map_or("?", |b| b.name.as_str());
+                    ui.label(format!("{name} face {}  to  {}", m.face + 1, self.project.mate_target_name(m.to)));
+                    if ui
+                        .selectable_label(m.flip, "Flip")
+                        .on_hover_text("Turn the face the same way as the target instead of against it")
+                        .clicked()
+                    {
+                        flip = Some(i);
+                    }
+                    if icons::icon_button(ui, icons::Icon::Remove, "Remove mate (the part stays where it is)").clicked() {
+                        del = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = flip {
+                self.project.mates[i].flip ^= true;
+                if let Err(e) = self.project.apply_mate(i) {
+                    self.msgs.push(e);
+                }
+            }
+            if let Some(i) = del {
+                self.project.mates.remove(i);
+            }
+        }
         // Orientation of the selected part.
         if let Some(bi) = self.selected_body.filter(|&i| i < self.project.bodies.len()) {
             ui.add_space(6.0);
@@ -685,8 +718,7 @@ impl P3App {
                 }
             });
             ui.horizontal(|ui| {
-                ui.toggle_value(&mut self.lay_face, "Lay face on bed")
-                    .on_hover_text("Then click a flat face of a part in the view.");
+                mate_button(ui, &mut self.lay_face, &mut self.mate_first);
                 if ui.button("Reset").on_hover_text("Back to the orientation of the file").clicked() {
                     self.project.bodies[bi].reset_rotation();
                 }
@@ -699,6 +731,18 @@ impl P3App {
         if insert {
             self.insert_step_file();
         }
+    }
+}
+
+/// Mate: click a flat face of a part, then a face of another part or a
+/// surface of the workspace. The part is turned and moved so they coincide.
+fn mate_button(ui: &mut egui::Ui, on: &mut bool, first: &mut Option<(usize, usize)>) {
+    if ui
+        .toggle_value(on, "Mate faces")
+        .on_hover_text("Click a flat face of a part, then a face of another part or a surface of the workspace. The first face is brought flat against the second.")
+        .changed()
+    {
+        *first = None;
     }
 }
 

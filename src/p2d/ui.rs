@@ -110,7 +110,7 @@ impl App {
 
     pub(crate) fn project_screen(&mut self, root: &mut egui::Ui, actions: &mut Vec<Action>) {
         if let Some(p3) = &mut self.p3 {
-            p3.show(root, &self.lib);
+            p3.show(root, &self.lib, &self.settings.controls, &self.cmds);
             let msgs = std::mem::take(&mut p3.msgs);
             for m in msgs {
                 self.say(m);
@@ -124,8 +124,7 @@ impl App {
                     icons::tab_strip(ui, &[
                         (icons::Icon::TabPrepare, "Prepare", true),
                         (icons::Icon::TabPath, "Path selection", true),
-                        (icons::Icon::TabSimulation, "Simulation", true),
-                        (icons::Icon::TabGcode, "G-code", true),
+                        (icons::Icon::TabSimulation, "Run", true),
                     ], 0);
                     for h in ["Parts", "Job settings", "Sequence"] {
                         ui.collapsing(h, |ui| {
@@ -138,30 +137,32 @@ impl App {
             return;
         }
 
-        let Self { lib, project, canvas, gcode, warnings, tab, preview, seq_drag, .. } = self;
+        let Self { lib, project, canvas, gcode, warnings, tab, preview, seq_drag, settings, cmds, .. } = self;
         let project = project.as_mut().unwrap();
         let generated = preview.has_path();
-        if matches!(*tab, ProjectTab::Preview | ProjectTab::Gcode) && !generated {
+        if *tab == ProjectTab::Run && !generated {
             *tab = ProjectTab::Prepare;
         }
 
         match *tab {
             ProjectTab::Prepare => canvas.tool = Tool::Move,
             ProjectTab::PathSelection => canvas.tool = Tool::Sequence,
-            ProjectTab::Preview | ProjectTab::Gcode => {}
+            ProjectTab::Run => {}
         }
 
         egui::Panel::left("left").resizable(false).exact_size(330.0).show(root, |ui| {
-            const ORDER: [ProjectTab; 4] = [ProjectTab::Prepare, ProjectTab::PathSelection, ProjectTab::Preview, ProjectTab::Gcode];
+            const ORDER: [ProjectTab; 3] = [ProjectTab::Prepare, ProjectTab::PathSelection, ProjectTab::Run];
             let cur = ORDER.iter().position(|t| *t == *tab).unwrap_or(0);
             let picked = icons::tab_strip(ui, &[
                 (icons::Icon::TabPrepare, "Prepare", true),
                 (icons::Icon::TabPath, "Path selection", true),
-                (icons::Icon::TabSimulation, "Simulation", generated),
-                (icons::Icon::TabGcode, "G-code", generated),
+                (icons::Icon::TabSimulation, "Run", generated),
             ], cur);
             if let Some(i) = picked {
                 *tab = ORDER[i];
+            }
+            if *tab == ProjectTab::Run && preview.machine_mode {
+                preview::console_panel(ui, preview);
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match *tab {
@@ -292,23 +293,11 @@ impl App {
                             ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
                         }
                     }
-                    ProjectTab::Gcode => {
-                        ui.heading("G-code");
-                        ui.label(format!("{} lines", gcode.lines().count()));
-                        if ui.button("Save...").clicked() {
-                            actions.push(Action::SaveGcode);
-                        }
-                        if ui.button("Copy to clipboard").clicked() {
-                            ui.ctx().copy_text(gcode.clone());
-                            actions.push(Action::CopyGcode);
-                        }
-                        for w in warnings.iter() {
-                            ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
-                        }
-                    }
-                    ProjectTab::Preview => {
+                    ProjectTab::Run => {
                         let m = &project.machine;
-                        ui.heading("Simulation");
+                        ui.heading("Run");
+                        preview::run_controls(ui, preview, &project.machine, &settings.controls, cmds, gcode);
+                        ui.separator();
                         egui::Grid::new("pv_stats").num_columns(2).show(ui, |ui| {
                             ui.label("Machine");
                             ui.label(&m.name);
@@ -339,53 +328,21 @@ impl App {
                                 .small()
                                 .weak(),
                         );
-                        for w in warnings.iter() {
-                            ui.colored_label(Color32::from_rgb(0xff, 0xb0, 0x40), format!("! {w}"));
-                        }
                     }
                 }
             });
         });
 
-        if *tab == ProjectTab::Preview {
-            egui::Panel::bottom("preview_bar").show(root, |ui| {
-                let total = preview.total_time();
-                ui.horizontal(|ui| {
-                    let label = if preview.playing { "Pause" } else if preview.time >= total { "Replay" } else { "Play" };
-                    if ui.button(label).clicked() {
-                        if preview.playing {
-                            preview.playing = false;
-                        } else {
-                            if preview.time >= total {
-                                preview.time = 0.0;
-                            }
-                            preview.playing = true;
-                        }
+        if *tab == ProjectTab::Run {
+            egui::Panel::right("gcode_right").default_size(320.0).show(root, |ui| {
+                match crate::common::gcode_panel::show(ui, gcode, preview.current_line()) {
+                    Some(crate::common::gcode_panel::Tool::Save) => actions.push(Action::SaveGcode),
+                    Some(crate::common::gcode_panel::Tool::Copy) => {
+                        ui.ctx().copy_text(gcode.clone());
+                        actions.push(Action::CopyGcode);
                     }
-                    if ui.button("Reset").clicked() {
-                        preview.time = 0.0;
-                        preview.playing = false;
-                    }
-                    let w = (ui.available_width() - 260.0).max(100.0);
-                    ui.spacing_mut().slider_width = w;
-                    let mut t = preview.time;
-                    if ui
-                        .add(egui::Slider::new(&mut t, 0.0..=total.max(0.001)).show_value(false))
-                        .changed()
-                    {
-                        preview.time = t;
-                        preview.playing = false;
-                    }
-                    ui.monospace(format!("{} / {}", preview::fmt_time(preview.time), preview::fmt_time(total)));
-                    egui::ComboBox::from_id_salt("pv_speed")
-                        .width(60.0)
-                        .selected_text(format!("{}x", preview::SPEEDS[preview.speed_idx]))
-                        .show_ui(ui, |ui| {
-                            for (i, s) in preview::SPEEDS.iter().enumerate() {
-                                ui.selectable_value(&mut preview.speed_idx, i, format!("{s}x"));
-                            }
-                        });
-                });
+                    None => {}
+                }
             });
         }
 
@@ -415,7 +372,7 @@ impl App {
                         canvas.sel_steps.clear();
                     }
                 }
-                ProjectTab::Preview => {
+                ProjectTab::Run => {
                     ui.horizontal(|ui| {
                         ui.add_space(6.0);
                         if ui.button("Iso").clicked() {
@@ -429,17 +386,9 @@ impl App {
                         }
                         ui.checkbox(&mut preview.show_travel, "Travel moves");
                         ui.checkbox(&mut preview.show_full, "Whole path");
+                        ui.checkbox(&mut preview.show_parts, "Parts");
                     });
                     preview.show(ui, &project.machine);
-                }
-                ProjectTab::Gcode => {
-                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut gcode.as_str())
-                                .code_editor()
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
                 }
             });
     }

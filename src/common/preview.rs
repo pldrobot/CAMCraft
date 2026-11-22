@@ -14,10 +14,27 @@ pub struct Preview {
     pub zoom: f32,
     pub pan: Vec2,
     pub playing: bool,
+    /// Run target: false = simulator, true = real machine.
+    pub machine_mode: bool,
+    /// The real machine on a serial port.
+    pub live: crate::common::link::Live,
+    /// Manual position of the simulated machine (G-code coordinates). None: at home.
+    pub jog: Option<V3>,
+    /// Selected jog step size, index into the controls' step list.
+    pub step_idx: usize,
+    /// Steps in mm used when the custom step is selected (`step_idx` past the list).
+    pub custom_xy: f64,
+    /// Gamepad speed level, when a gamepad is connected.
+    pub pad_speed: Option<f64>,
+    pub custom_z: f64,
     /// Index into `speeds`.
     pub speed_idx: usize,
     pub show_travel: bool,
     pub show_full: bool,
+    /// Draw the project's parts (outlines on the bed) under the toolpath.
+    pub show_parts: bool,
+    /// Part outlines in bed coordinates, set when the G-code is generated.
+    pub outlines: Vec<Vec<V3>>,
     /// Playback position in seconds of machine time.
     pub time: f64,
     moves: Vec<Move>,
@@ -36,9 +53,18 @@ impl Default for Preview {
             zoom: 1.0,
             pan: Vec2::ZERO,
             playing: false,
+            machine_mode: false,
+            live: Default::default(),
+            jog: None,
+            step_idx: 1,
+            custom_xy: 5.0,
+            pad_speed: None,
+            custom_z: 1.0,
             speed_idx: 2,
             show_travel: true,
             show_full: true,
+            show_parts: true,
+            outlines: vec![],
             time: 0.0,
             moves: vec![],
             cum: vec![],
@@ -56,7 +82,7 @@ pub fn fmt_time(s: f64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-fn effector_color(kind: EffectorKind) -> Color32 {
+pub(crate) fn effector_color(kind: EffectorKind) -> Color32 {
     match kind {
         EffectorKind::Glue => Color32::from_rgb(0xff, 0xb3, 0x2c),
         EffectorKind::Laser => Color32::from_rgb(0xff, 0x4d, 0x4d),
@@ -119,6 +145,18 @@ impl Preview {
         (p, m.work && t > 0.0 && t < self.total_time())
     }
 
+    /// G-code line being run: shown from the first Start until Stop.
+    pub fn current_line(&self) -> Option<usize> {
+        if self.machine_mode {
+            return self.live.acked.filter(|_| self.live.connected());
+        }
+        if self.moves.is_empty() || (!self.playing && self.time <= 0.0) {
+            return None;
+        }
+        let i = self.cum.partition_point(|&c| c < self.time).min(self.moves.len() - 1);
+        Some(self.moves[i].line)
+    }
+
     pub fn view_top(&mut self) {
         self.yaw = 0.0;
         self.pitch = std::f32::consts::FRAC_PI_2 - 0.001;
@@ -132,17 +170,8 @@ impl Preview {
     }
 
     pub fn view_iso(&mut self) {
-        *self = Self {
-            moves: std::mem::take(&mut self.moves),
-            cum: std::mem::take(&mut self.cum),
-            time: self.time,
-            playing: self.playing,
-            speed_idx: self.speed_idx,
-            show_travel: self.show_travel,
-            show_full: self.show_full,
-            path_len: self.path_len,
-            ..Self::default()
-        };
+        let d = Self::default();
+        (self.yaw, self.pitch, self.zoom, self.pan) = (d.yaw, d.pitch, d.zoom, d.pan);
     }
 
     pub fn show(&mut self, ui: &mut Ui, machine: &Machine) {
@@ -166,20 +195,85 @@ impl Preview {
             }
         }
 
-        // Playback.
-        let total = self.total_time();
-        if self.playing {
-            let dt = ui.input(|i| i.stable_dt) as f64;
-            self.time += dt * SPEEDS[self.speed_idx];
-            if self.time >= total {
-                self.time = total;
-                self.playing = false;
-            }
-            ui.ctx().request_repaint();
-        }
-        let (tool, working) = self.state_at(self.time);
+        self.tick(ui.ctx());
+        let (tool, working) = self.tool_now();
 
         self.paint(&painter, rect, machine, tool, working, false);
+    }
+
+    /// Advance the simulated run by the frame time while it is playing.
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        if !self.playing {
+            return;
+        }
+        self.time += ctx.input(|i| i.stable_dt) as f64 * SPEEDS[self.speed_idx];
+        let total = self.total_time();
+        if self.time >= total {
+            self.time = total;
+            self.playing = false;
+        }
+        ctx.request_repaint();
+    }
+
+    /// Tool position (G-code coordinates) and whether it is working, now.
+    pub fn tool_now(&self) -> (V3, bool) {
+        if let (true, Some(p)) = (self.machine_mode, self.live.pos) {
+            return (p, self.live.job);
+        }
+        match self.jog {
+            Some(p) if !self.playing && self.time <= 0.0 => (p, false),
+            _ => self.state_at(self.time),
+        }
+    }
+
+    /// Move the idle simulated machine by `d` mm, staying inside the machine travel.
+    pub fn jog_by(&mut self, d: V3, m: &Machine) {
+        if self.playing || self.time > 0.0 || self.moves.is_empty() {
+            return;
+        }
+        let cur = self.tool_now().0;
+        let w = m.tool_range(); // the full travel, also beyond the bed
+        self.jog = Some([0, 1, 2].map(|i| (cur[i] + d[i]).clamp(w[i].0, w[i].1)));
+    }
+
+    /// Send the chosen axes to the home position.
+    pub fn jog_home(&mut self, axes: [bool; 3], m: &Machine) {
+        if self.playing || self.time > 0.0 || self.moves.is_empty() {
+            return;
+        }
+        let (cur, home) = (self.tool_now().0, m.home_position());
+        self.jog = Some([0, 1, 2].map(|i| if axes[i] { home[i] } else { cur[i] }));
+    }
+
+    pub fn stop(&mut self) {
+        self.time = 0.0;
+        self.playing = false;
+        self.jog = None;
+    }
+
+    /// Start, pause or resume the run. A run always starts from home.
+    pub fn start_pause(&mut self) {
+        if self.machine_mode || self.moves.is_empty() {
+            return;
+        }
+        if self.playing {
+            self.playing = false;
+            return;
+        }
+        if self.time <= 0.0 || self.time >= self.total_time() {
+            self.time = 0.0;
+        }
+        self.jog = None;
+        self.playing = true;
+    }
+
+    /// Every move as (from, to, work, done) where done is 0..1 of the move already run.
+    pub fn segments(&self) -> impl Iterator<Item = (V3, V3, bool, f64)> + '_ {
+        self.moves.iter().enumerate().map(move |(i, m)| {
+            let start = if i == 0 { 0.0 } else { self.cum[i - 1] };
+            let done = ((self.time - start) / (self.cum[i] - start).max(1e-12)).clamp(0.0, 1.0);
+            (m.from, m.to, m.work, done)
+        })
     }
 
     /// Static isometric picture of the machine for the machine editor: wireframe
@@ -403,6 +497,14 @@ impl Preview {
             );
         }
 
+        // Parts, so the toolpath can be followed over the real shapes.
+        if self.show_parts {
+            let st = Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x9a, 0xb4, 0xcc, 150));
+            for o in &self.outlines {
+                painter.add(Shape::line(o.iter().map(|p| proj(on_bed(*p))).collect(), st));
+            }
+        }
+
         // Toolpath.
         let done_c = accent;
         let todo_c = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 50);
@@ -514,4 +616,214 @@ impl Preview {
             Color32::from_rgb(0x7a, 0x86, 0x92),
         );
     }
+}
+
+/// Left panel of the Run tab: pick the target, start or stop the run, jog by hand.
+pub fn run_controls(
+    ui: &mut egui::Ui,
+    pv: &mut Preview,
+    m: &Machine,
+    ctl: &crate::common::controls::Controls,
+    cmds: &[crate::common::controls::Cmd],
+    gcode: &str,
+) {
+    pv.live.poll();
+    crate::common::controls::apply(cmds, pv, m, ctl);
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut pv.machine_mode, false, "Simulator");
+        ui.radio_value(&mut pv.machine_mode, true, "Machine");
+    });
+    if pv.machine_mode {
+        pv.playing = false;
+        machine_panel(ui, pv, m, gcode);
+        ui.add_space(6.0);
+        crate::common::controls::jog_panel(ui, pv, m, ctl);
+        return;
+    }
+    let total = pv.total_time();
+    ui.horizontal(|ui| {
+        let label = if pv.playing { "Pause" } else if pv.time > 0.0 && pv.time < total { "Resume" } else { "Start" };
+        if ui.button(label).clicked() {
+            pv.start_pause();
+        }
+        if ui.button("Stop").clicked() {
+            pv.stop();
+        }
+        egui::ComboBox::from_id_salt("run_speed")
+            .width(60.0)
+            .selected_text(format!("{}x", SPEEDS[pv.speed_idx]))
+            .show_ui(ui, |ui| {
+                for (i, s) in SPEEDS.iter().enumerate() {
+                    ui.selectable_value(&mut pv.speed_idx, i, format!("{s}x"));
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        let status = if pv.playing { "Running" } else if pv.time >= total && total > 0.0 { "Done" } else if pv.time > 0.0 { "Paused" } else { "Idle" };
+        ui.label("Status:");
+        ui.strong(status);
+        ui.monospace(format!("{} / {}", fmt_time(pv.time), fmt_time(total)));
+    });
+    ui.add_space(6.0);
+    crate::common::controls::jog_panel(ui, pv, m, ctl);
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    #[test]
+    fn current_line_follows_time() {
+        let mv = |x: f64, line| Move { from: [x - 1.0, 0.0, 0.0], to: [x, 0.0, 0.0], work: true, line };
+        let mut pv = Preview::default();
+        pv.set_moves(vec![mv(1.0, 3), mv(2.0, 7)], &JobSettings::default());
+        assert_eq!(pv.current_line(), None);
+        pv.time = 0.001;
+        assert_eq!(pv.current_line(), Some(3));
+        pv.time = pv.total_time();
+        assert_eq!(pv.current_line(), Some(7));
+    }
+}
+
+#[cfg(test)]
+mod jog_tests {
+    use super::*;
+
+    #[test]
+    fn jog_clamps_homes_and_is_blocked_while_running() {
+        let m = Machine::new("m");
+        let mv = Move { from: m.home_position(), to: [10.0, 0.0, m.home_position()[2]], work: true, line: 0 };
+        let mut pv = Preview::default();
+        pv.set_moves(vec![mv], &JobSettings::default());
+        pv.jog_by([-500.0, 5.0, 0.0], &m);
+        assert_eq!(pv.tool_now().0[0], 0.0); // clamped to the workable area
+        assert_eq!(pv.tool_now().0[1], 5.0);
+        pv.jog_home([false, true, false], &m);
+        assert_eq!(pv.tool_now().0[1], m.home_position()[1]);
+        pv.start_pause();
+        assert!(pv.jog.is_none() && pv.playing);
+        pv.jog_by([1.0, 0.0, 0.0], &m);
+        assert!(pv.jog.is_none());
+    }
+}
+
+/// Port, connection, start / pause / stop and the console of the real machine.
+fn machine_panel(ui: &mut egui::Ui, pv: &mut Preview, m: &Machine, gcode: &str) {
+    use crate::common::machine::Firmware;
+    let live = &mut pv.live;
+    if !live.scanned {
+        live.refresh_ports();
+    }
+    let usable = m.firmware != Firmware::LinuxCnc;
+    if !usable {
+        ui.label(egui::RichText::new("LinuxCNC has no serial G-code link. Save the G-code and run it from LinuxCNC.").small().weak());
+    }
+    ui.add_enabled_ui(usable && !live.connected(), |ui| {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("live_port")
+                .width(120.0)
+                .selected_text(if live.port.is_empty() { "no port".to_string() } else { live.port.clone() })
+                .show_ui(ui, |ui| {
+                    for p in live.ports.clone() {
+                        ui.selectable_value(&mut live.port, p.clone(), p);
+                    }
+                });
+            if ui.button("Refresh").clicked() {
+                live.refresh_ports();
+            }
+            let baud = if live.baud == 0 { m.baud } else { live.baud };
+            egui::ComboBox::from_id_salt("live_baud").width(80.0).selected_text(baud.to_string()).show_ui(ui, |ui| {
+                for b in [9600, 19200, 38400, 57600, 115_200, 230_400, 250_000, 460_800, 500_000, 1_000_000] {
+                    ui.selectable_value(&mut live.baud, b, b.to_string());
+                }
+            });
+        });
+    });
+    ui.horizontal(|ui| {
+        if live.connected() {
+            if ui.button("Disconnect").clicked() {
+                live.disconnect();
+            }
+        } else if ui.add_enabled(usable && !live.port.is_empty(), egui::Button::new("Connect")).clicked() {
+            let baud = if live.baud == 0 { m.baud } else { live.baud };
+            live.connect(baud, m.firmware);
+        }
+        let state = if live.connected() { live.state.clone() } else { "Disconnected".into() };
+        ui.label("Status:");
+        ui.strong(if state.is_empty() { "Connected".into() } else { state });
+    });
+    if let Some(e) = &live.error {
+        ui.colored_label(egui::Color32::from_rgb(0xff, 0x6a, 0x5a), e);
+    }
+    let alarm = live.state.eq_ignore_ascii_case("alarm");
+    ui.horizontal(|ui| {
+        let ready = live.can_jog() && !gcode.is_empty();
+        if live.job {
+            if ui.button(if live.paused { "Resume" } else { "Pause" }).clicked() {
+                live.pause_resume();
+            }
+        } else if ui.add_enabled(ready, egui::Button::new("Start")).clicked() {
+            live.confirm = true;
+        }
+        // Always there, also when nothing is running: it also cancels a jog.
+        let stop = egui::Button::new(egui::RichText::new("STOP").strong()).fill(egui::Color32::from_rgb(0xb0, 0x2a, 0x20));
+        if ui.add_enabled(live.connected(), stop).clicked() {
+            live.stop(vec![m.effector.off_line()]);
+        }
+        if alarm && m.firmware == Firmware::Grbl && ui.button("Unlock").on_hover_text("Send $X to clear the alarm").clicked() {
+            live.unlock();
+        }
+    });
+    if live.job {
+        let total = crate::common::link::job_lines(gcode).len();
+        ui.label(format!("Sending: line {} of {}", live.acked.map_or(0, |n| n + 1), gcode.lines().count().max(total)));
+    }
+    if live.confirm {
+        egui::Window::new("Start the job on the machine?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("{} will move. Make sure the area is clear and the end effector is safe.", m.name));
+                ui.horizontal(|ui| {
+                    if ui.button("Start job").clicked() {
+                        live.confirm = false;
+                        live.start_job(gcode);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        live.confirm = false;
+                    }
+                });
+            });
+    }
+    if live.connected() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Console of the real machine, fixed to the bottom of the left panel.
+pub fn console_panel(ui: &mut egui::Ui, pv: &mut Preview) {
+    let live = &mut pv.live;
+    // A fixed height: a resizable panel grew to fill the whole left panel.
+    egui::Panel::bottom("console_bottom").resizable(false).exact_size(200.0).show(ui, |ui| {
+        // Built from the bottom up: the input line keeps its place, the log takes the rest.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut live.console).hint_text("G-code").desired_width(ui.available_width() - 50.0));
+                let go = ui.button("Send").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if go && live.can_jog() && !live.console.trim().is_empty() {
+                    let l = std::mem::take(&mut live.console);
+                    live.send_manual(vec![l.trim().to_string()]);
+                    r.request_focus();
+                }
+            });
+            let h = (ui.available_height() - 24.0).max(20.0);
+            egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).max_height(h).show(ui, |ui| {
+                for l in &live.log {
+                    ui.label(egui::RichText::new(l).monospace().small());
+                }
+            });
+            ui.strong("Console");
+        });
+    });
 }

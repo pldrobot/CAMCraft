@@ -232,6 +232,69 @@ fn rotation_between(a: V3, b: V3) -> Rot {
     axis_rotation([axis[0] / s, axis[1] / s, axis[2] / s], s.atan2(c))
 }
 
+/// What a mate brings a face to.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MateTo {
+    Wall(Wall),
+    /// (part, face)
+    Face(usize, usize),
+}
+
+/// A face of a part mated to a workspace surface or a face of another part.
+/// Applied when made and again when `flip` changes; it does not follow later
+/// moves.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mate {
+    pub body: usize,
+    pub face: usize,
+    pub to: MateTo,
+    /// Face turned the same way as the target instead of against it.
+    pub flip: bool,
+}
+
+/// A surface of the workspace a part face can be aligned with.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Wall {
+    Bed,
+    Top,
+    XMin,
+    XMax,
+    YMin,
+    YMax,
+}
+
+impl Wall {
+    pub const ALL: [Wall; 6] = [Wall::Bed, Wall::XMin, Wall::XMax, Wall::YMin, Wall::YMax, Wall::Top];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Wall::Bed => "Bed (Z min)",
+            Wall::Top => "Top (Z max)",
+            Wall::XMin => "Left (X min)",
+            Wall::XMax => "Right (X max)",
+            Wall::YMin => "Front (Y min)",
+            Wall::YMax => "Back (Y max)",
+        }
+    }
+
+    /// Normal into the workspace and a point of the wall; `vol` is the
+    /// workable volume (G-code coordinates).
+    pub fn plane(self, vol: &[(f64, f64); 3]) -> (V3, V3) {
+        let (k, out) = match self {
+            Wall::Bed => (2, -1.0),
+            Wall::Top => (2, 1.0),
+            Wall::XMin => (0, -1.0),
+            Wall::XMax => (0, 1.0),
+            Wall::YMin => (1, -1.0),
+            Wall::YMax => (1, 1.0),
+        };
+        let (mut n, mut p) = ([0.0; 3], [0.0; 3]);
+        n[k] = -out;
+        p[k] = if out < 0.0 { vol[k].0 } else { vol[k].1 };
+        (n, p)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Body {
     pub name: String,
@@ -258,6 +321,48 @@ impl Body {
     /// A direction (e.g. a normal) in bed coordinates.
     pub fn rotate_dir(&self, d: V3) -> V3 {
         rot_apply(&self.rot, d)
+    }
+
+    /// Is the point (bed coordinates) inside the solid? Counts how often a ray from the
+    /// point crosses the surface: odd means inside. Needs a closed mesh.
+    pub fn contains(&self, p: V3) -> bool {
+        let Some(g) = &self.geo else { return false };
+        let r = &self.rot;
+        let t = [r[0], r[3], r[6], r[1], r[4], r[7], r[2], r[5], r[8]]; // inverse of a rotation
+        let o = rot_apply(&t, [p[0] - self.offset[0], p[1] - self.offset[1], p[2] - self.offset[2]]);
+        if (0..3).any(|k| o[k] < g.min[k] || o[k] > g.max[k]) {
+            return false;
+        }
+        // Slightly tilted so the ray does not run along mesh edges.
+        let d = [0.0123, 0.0071, 1.0];
+        let (mut hits, sub, cross) = (0, |a: V3, b: V3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]], |a: V3, b: V3| {
+            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        });
+        let dot = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        for f in &g.faces {
+            for tri in &f.tris {
+                let (e1, e2) = (sub(tri[1], tri[0]), sub(tri[2], tri[0]));
+                let pv = cross(d, e2);
+                let det = dot(e1, pv);
+                if det.abs() < 1e-12 {
+                    continue;
+                }
+                let tv = sub(o, tri[0]);
+                let u = dot(tv, pv) / det;
+                if !(0.0..=1.0).contains(&u) {
+                    continue;
+                }
+                let qv = cross(tv, e1);
+                let v = dot(d, qv) / det;
+                if v < 0.0 || u + v > 1.0 {
+                    continue;
+                }
+                if dot(e2, qv) / det > 0.0 {
+                    hits += 1;
+                }
+            }
+        }
+        hits % 2 == 1
     }
 
     /// Bounding box on the bed.
@@ -314,8 +419,8 @@ impl Body {
         self.rotate(&inv, false);
     }
 
-    /// Turn the part so the flat face `face` lies on the bed.
-    pub fn lay_face_down(&mut self, face: usize) -> Result<(), String> {
+    /// Outward normal and centre (bed coordinates) of the flat face `face`.
+    pub fn face_plane(&self, face: usize) -> Result<(V3, V3), String> {
         let g = self.geo.clone().ok_or("The part is not loaded.")?;
         let f = g.faces.get(face).ok_or("No such face.")?;
         let (mut sum, mut mag, mut centre) = ([0.0; 3], 0.0, [0.0; 3]);
@@ -343,8 +448,21 @@ impl Body {
         if (mid[0] - p[0]) * n[0] + (mid[1] - p[1]) * n[1] + (mid[2] - p[2]) * n[2] > 0.0 {
             n = [-n[0], -n[1], -n[2]];
         }
-        let r = rotation_between(n, [0.0, 0.0, -1.0]);
-        self.rotate(&r, false);
+        Ok((n, p))
+    }
+
+    /// Mate: turn and move the part so its flat face `face` lies on the plane
+    /// through `tp` whose normal `tn` points into free space (coincident,
+    /// facing the other way). The face may slide along the plane.
+    pub fn mate_face(&mut self, face: usize, tn: V3, tp: V3, flip: bool) -> Result<(), String> {
+        let (n, _) = self.face_plane(face)?;
+        let want = if flip { tn } else { [-tn[0], -tn[1], -tn[2]] };
+        self.rotate(&rotation_between(n, want), true);
+        let (_, p) = self.face_plane(face)?;
+        let d = (tp[0] - p[0]) * tn[0] + (tp[1] - p[1]) * tn[1] + (tp[2] - p[2]) * tn[2];
+        for k in 0..3 {
+            self.offset[k] += d * tn[k];
+        }
         Ok(())
     }
 }
@@ -355,11 +473,31 @@ pub struct Project3 {
     pub job: Job3,
     pub bodies: Vec<Body>,
     pub sequence: Vec<Step3>,
+    #[serde(default)]
+    pub mates: Vec<Mate>,
 }
 
 impl Project3 {
     pub fn new(machine: Machine) -> Self {
-        Self { machine, job: Job3::default(), bodies: vec![], sequence: vec![] }
+        Self { machine, job: Job3::default(), bodies: vec![], sequence: vec![], mates: vec![] }
+    }
+
+    /// Name of what a mate goes to.
+    pub fn mate_target_name(&self, to: MateTo) -> String {
+        match to {
+            MateTo::Wall(w) => w.label().to_string(),
+            MateTo::Face(b, f) => format!("{} face {}", self.bodies.get(b).map_or("?", |b| b.name.as_str()), f + 1),
+        }
+    }
+
+    /// Move the part of mate `i` so the mate holds.
+    pub fn apply_mate(&mut self, i: usize) -> Result<(), String> {
+        let m = *self.mates.get(i).ok_or("No such mate.")?;
+        let (n, p) = match m.to {
+            MateTo::Wall(w) => w.plane(&self.machine.workable()),
+            MateTo::Face(b, f) => self.bodies.get(b).ok_or("The part is gone.")?.face_plane(f)?,
+        };
+        self.bodies.get_mut(m.body).ok_or("The part is gone.")?.mate_face(m.face, n, p, m.flip)
     }
 
     pub fn remove_body(&mut self, idx: usize) {
@@ -367,6 +505,17 @@ impl Project3 {
             return;
         }
         self.bodies.remove(idx);
+        self.mates.retain(|m| m.body != idx && !matches!(m.to, MateTo::Face(b, _) if b == idx));
+        for m in &mut self.mates {
+            if m.body > idx {
+                m.body -= 1;
+            }
+            if let MateTo::Face(b, f) = m.to {
+                if b > idx {
+                    m.to = MateTo::Face(b - 1, f);
+                }
+            }
+        }
         // Steps keep their place; what pointed at the removed part is cleared.
         let shift = |r: &mut Option<(usize, usize)>| {
             if let Some((b, f)) = *r {
@@ -1229,7 +1378,8 @@ mod tests {
     #[test]
     fn lay_a_side_face_on_the_bed() {
         let mut b = cube();
-        b.lay_face_down(0).unwrap(); // the x = 10 face
+        let (n, p) = Wall::Bed.plane(&[(0.0, 300.0), (0.0, 300.0), (0.0, 100.0)]);
+        b.mate_face(0, n, p, false).unwrap(); // the x = 10 face
         let (lo, hi) = b.bounds();
         assert!(lo[2].abs() < 1e-9, "{lo:?}");
         // The cube now stands 10 high on its 20 x 30 face.
@@ -1240,6 +1390,28 @@ mod tests {
         b.reset_rotation();
         let (lo, hi) = b.bounds();
         assert!((hi[0] - lo[0] - 10.0).abs() < 1e-9 && lo[2].abs() < 1e-9);
+    }
+
+    #[test]
+    fn align_a_face_with_a_wall() {
+        let vol = [(0.0, 300.0), (0.0, 200.0), (0.0, 100.0)];
+        let mut b = cube(); // 10 x 20 x 30
+        let (n, p) = Wall::XMax.plane(&vol);
+        b.mate_face(0, n, p, false).unwrap(); // the x = 10 face
+        let (lo, hi) = b.bounds();
+        assert!((hi[0] - 300.0).abs() < 1e-9 && (hi[0] - lo[0] - 10.0).abs() < 1e-9 && lo[2].abs() < 1e-9, "{lo:?} {hi:?}");
+        let (n, p) = Wall::Top.plane(&vol);
+        b.mate_face(0, n, p, false).unwrap();
+        assert!((b.bounds().1[2] - 100.0).abs() < 1e-9);
+        // Mate to the face of another part: the x = 0 face of a cube at x = 200
+        // meets that cube's x = 10 face (at x = 210) from the outside.
+        let mut a = cube();
+        a.offset = [200.0, 0.0, 0.0];
+        let (n, p) = a.face_plane(0).unwrap();
+        let mut c = cube();
+        c.mate_face(2, n, p, false).unwrap(); // some other face first to prove rotation
+        let (cn, cp) = c.face_plane(2).unwrap();
+        assert!((cn[0] + 1.0).abs() < 1e-9 && (cp[0] - 210.0).abs() < 1e-9, "{cn:?} {cp:?}");
     }
 
     #[test]
@@ -1357,5 +1529,30 @@ mod tests {
         assert!(s.open);
         let back: Step3 = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(!back.open);
+    }
+}
+
+#[cfg(test)]
+mod contains_tests {
+    use super::*;
+    use crate::p3d::step::{FaceMesh, Geometry};
+
+    #[test]
+    fn point_inside_a_cube_only() {
+        let v = |x: f64, y: f64, z: f64| [x * 10.0, y * 10.0, z * 10.0];
+        let quads = [
+            [v(0., 0., 0.), v(1., 0., 0.), v(1., 1., 0.), v(0., 1., 0.)],
+            [v(0., 0., 1.), v(1., 0., 1.), v(1., 1., 1.), v(0., 1., 1.)],
+            [v(0., 0., 0.), v(1., 0., 0.), v(1., 0., 1.), v(0., 0., 1.)],
+            [v(0., 1., 0.), v(1., 1., 0.), v(1., 1., 1.), v(0., 1., 1.)],
+            [v(0., 0., 0.), v(0., 1., 0.), v(0., 1., 1.), v(0., 0., 1.)],
+            [v(1., 0., 0.), v(1., 1., 0.), v(1., 1., 1.), v(1., 0., 1.)],
+        ];
+        let faces = quads.iter().map(|q| FaceMesh { tris: vec![[q[0], q[1], q[2]], [q[0], q[2], q[3]]], nors: vec![] }).collect();
+        let g = Geometry { notes: vec![], faces, edges: vec![], min: [0.0; 3], max: [10.0; 3] };
+        let b = Body::new("cube".into(), String::new(), [100.0, 0.0, 0.0], Some(Arc::new(g)));
+        assert!(b.contains([105.0, 5.0, 5.0]));
+        assert!(!b.contains([95.0, 5.0, 5.0]));
+        assert!(!b.contains([105.0, 5.0, 15.0]));
     }
 }

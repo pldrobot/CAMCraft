@@ -1,7 +1,8 @@
 //! 3D viewer of the 3D project: orbit camera, shaded solids with dark edges on
 //! a light gradient (CAD style), bed and workable volume, picking.
 
-use super::model::Project3;
+use super::model::{Project3, Wall};
+use crate::common::machine::{AxisOwner, Machine};
 use super::raster::{self, Frame};
 use super::step::V3;
 use eframe::egui::{self, Align2, Color32, FontId, PointerButton, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, TextureOptions, Ui};
@@ -34,11 +35,13 @@ struct Proj {
     u: V3,
     focal: f64,
     c: Pos2,
+    /// Added to every point before projecting: the bed sliding in the Run view.
+    shift: V3,
 }
 
 impl Proj {
     fn cam(&self, p: V3) -> V3 {
-        let d = sub(p, self.eye);
+        let d = sub([p[0] + self.shift[0], p[1] + self.shift[1], p[2] + self.shift[2]], self.eye);
         [dot(d, self.r), dot(d, self.u), dot(d, self.f)]
     }
 
@@ -91,8 +94,11 @@ pub enum PickMode {
     Edges,
     /// Path selection: click a surface.
     Surface,
-    /// Prepare: click a flat face to lay it on the bed.
+    /// Prepare, mate: click the flat face to move.
     LayFace,
+    /// Prepare, mate: click the face of another part, or a workspace surface,
+    /// to mate the first face to.
+    MateTarget,
     /// Path selection: click a spot on a surface.
     Point,
     /// A start or stop: click an edge or a surface, Ctrl+click a point on it.
@@ -118,6 +124,8 @@ pub struct Overlay<'a> {
     pub steps: &'a [StepViz],
     pub show_steps: bool,
     pub sel_steps: &'a [usize],
+    /// Run tab: the simulated toolpath and tool, drawn over the parts.
+    pub run: Option<&'a crate::common::preview::Preview>,
 }
 
 #[derive(Default)]
@@ -126,6 +134,8 @@ pub struct ViewOut {
     pub body_click: Option<Option<usize>>,
     pub edge_click: Option<(usize, usize)>,
     pub face_click: Option<(usize, usize)>,
+    /// MateTarget: a workspace surface, when no part face is under the cursor.
+    pub wall_click: Option<Wall>,
     pub point_click: Option<V3>,
     /// Cursor on the bed plane.
     pub cursor: Option<[f64; 2]>,
@@ -142,6 +152,8 @@ pub struct View3 {
     key: u64,
     scale: f32,
     drag_body: Option<usize>,
+    /// Bit per body: the tool is inside it (Run view), drawn red.
+    red_mask: u64,
     last_ground: Option<V3>,
 }
 
@@ -158,9 +170,31 @@ impl Default for View3 {
             key: 0,
             scale: 1.0,
             drag_body: None,
+            red_mask: 0,
             last_ground: None,
         }
     }
+}
+
+/// Run view of a machine whose tool is at `tool` (G-code coordinates). Returns how far the
+/// bed (and the parts on it) is displaced from the G-code frame, and the machine box corner
+/// in the displaced frame. An axis that moves the bed shifts the bed by the opposite of the
+/// tool move; the box and the tool stay put on the screen.
+fn run_box(m: &Machine, tool: V3) -> (V3, V3) {
+    let (wb, bp, ep) = (m.workable_on_bed(), m.bed_position(), m.effector_position());
+    let home = m.home_position();
+    let w0 = [wb[0].0, wb[1].0, 0.0];
+    let (mut shift, mut lo) = ([0.0; 3], [0.0; 3]);
+    for i in 0..3 {
+        match m.axes[i] {
+            AxisOwner::Bed => {
+                shift[i] = home[i] - tool[i];
+                lo[i] = home[i] - ep[i];
+            }
+            AxisOwner::EndEffector => lo[i] = -(w0[i] + bp[i]),
+        }
+    }
+    (shift, lo)
 }
 
 fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
@@ -202,17 +236,48 @@ impl View3 {
         let f = norm(sub(self.target, eye));
         let r = norm(cross(f, [0.0, 0.0, 1.0]));
         let u = cross(r, f);
-        Proj { eye, f, r, u, focal: rect.height() as f64 / (2.0 * (FOV / 2.0).tan()), c: rect.center() }
+        Proj { eye, f, r, u, focal: rect.height() as f64 / (2.0 * (FOV / 2.0).tan()), c: rect.center(), shift: [0.0; 3] }
     }
 
-    fn fit_view(&mut self, project: &Project3) {
+    fn fit_view(&mut self, project: &Project3, run: bool) {
         let m = &project.machine;
+        if run {
+            // The whole machine box, so the bed can be followed over its travel.
+            let (_, lo) = run_box(m, m.home_position());
+            let f = m.frame_size();
+            self.target = [lo[0] + f[0] / 2.0, lo[1] + f[1] / 2.0, lo[2] + f[2] / 2.0];
+            self.dist = (0.5 * (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt() / (FOV / 2.0).sin() * 0.95).max(50.0);
+            return;
+        }
         let bed = m.bed_in_gcode();
         let tz = m.travel()[2];
         let (w, h) = (bed[0].1 - bed[0].0, bed[1].1 - bed[1].0);
         self.target = [(bed[0].0 + bed[0].1) / 2.0, (bed[1].0 + bed[1].1) / 2.0, tz * 0.25];
         let radius = 0.5 * (w * w + h * h + tz * tz).sqrt();
         self.dist = (radius / (FOV / 2.0).sin() * 0.95).max(50.0);
+    }
+
+    /// The workspace surface the cursor ray leaves through (the inside of the
+    /// green box: the bed from above, the far walls).
+    fn wall_at(&self, pr: &Proj, pos: Pos2, vol: &[(f64, f64); 3]) -> Option<Wall> {
+        let (o, d) = pr.ray(pos);
+        let mut best: Option<(f64, Wall)> = None;
+        for w in Wall::ALL {
+            let (n, p) = w.plane(vol);
+            let nd = dot(n, d);
+            if nd.abs() < 1e-9 {
+                continue;
+            }
+            let t = dot(n, sub(p, o)) / nd;
+            if t <= 0.0 || best.is_some_and(|b| b.0 >= t) {
+                continue;
+            }
+            let hit = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+            if (0..3).all(|k| n[k] != 0.0 || (hit[k] >= vol[k].0 - 1e-6 && hit[k] <= vol[k].1 + 1e-6)) {
+                best = Some((t, w));
+            }
+        }
+        best.map(|b| b.1)
     }
 
     fn face_at(&self, rect: Rect, pos: Pos2) -> Option<(usize, usize)> {
@@ -276,7 +341,7 @@ impl View3 {
         let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
         let rect = resp.rect;
         if self.fit {
-            self.fit_view(project);
+            self.fit_view(project, ov.run.is_some());
             self.fit = false;
         }
 
@@ -288,11 +353,30 @@ impl View3 {
             }
         }
         let mut pr = self.proj(rect);
+        // Run view: bodies the tool tip is inside.
+        self.red_mask = ov.run.map_or(0, |pv| {
+            let tool = pv.tool_now().0;
+            project.bodies.iter().take(64).enumerate().filter(|(_, b)| b.contains(tool)).fold(0, |m, (i, _)| m | 1u64 << i)
+        });
+        // Run view: where the bed is displaced to and where the machine box sits.
+        let run_state = ov.run.map(|pv| {
+            let (tool, _) = pv.tool_now();
+            run_box(&project.machine, tool)
+        });
+        if let Some((shift, _)) = run_state {
+            pr.shift = shift;
+        }
         let hover = resp.hover_pos();
         let face_hover = hover.and_then(|p| self.face_at(rect, p));
         let ctrl = ui.input(|i| i.modifiers.command);
         let edge_hover = if matches!(ov.mode, PickMode::Edges | PickMode::Any) {
             hover.and_then(|p| self.edge_at(project, &pr, rect, p))
+        } else {
+            None
+        };
+        let vol = project.machine.workable();
+        let wall_hover = if ov.mode == PickMode::MateTarget && face_hover.is_none() && vol[0].1 > 0.0 && vol[1].1 > 0.0 {
+            hover.and_then(|p| self.wall_at(&pr, p, &vol))
         } else {
             None
         };
@@ -345,6 +429,10 @@ impl View3 {
                 PickMode::Move => out.body_click = Some(face_hover.map(|f| f.0)),
                 PickMode::Edges => out.edge_click = edge_hover,
                 PickMode::Surface | PickMode::LayFace => out.face_click = face_hover,
+                PickMode::MateTarget => {
+                    out.face_click = face_hover;
+                    out.wall_click = wall_hover;
+                }
                 PickMode::Point => out.point_click = hover.and_then(|p| self.point_at(&pr, rect, p)),
                 PickMode::Any => {
                     if edge_hover.is_some() {
@@ -359,7 +447,7 @@ impl View3 {
             }
         }
         if resp.hovered() {
-            ui.ctx().set_cursor_icon(match (ov.mode, self.drag_body.is_some() || face_hover.is_some() || edge_hover.is_some()) {
+            ui.ctx().set_cursor_icon(match (ov.mode, self.drag_body.is_some() || face_hover.is_some() || edge_hover.is_some() || wall_hover.is_some()) {
                 (PickMode::Move, true) => egui::CursorIcon::Grab,
                 (_, true) => egui::CursorIcon::PointingHand,
                 _ => egui::CursorIcon::Default,
@@ -426,11 +514,11 @@ impl View3 {
         }
         let (wpx, hpx) = (((rect.width() * scale) as usize).max(1), ((rect.height() * scale) as usize).max(1));
         let any_face = ov.mode == PickMode::Any && edge_hover.is_none() && !ctrl;
-        let hover_tint = if matches!(ov.mode, PickMode::Surface | PickMode::LayFace) || any_face { face_hover } else { None };
+        let hover_tint = if matches!(ov.mode, PickMode::Surface | PickMode::LayFace | PickMode::MateTarget) || any_face { face_hover } else { None };
 
         let mut h = DefaultHasher::new();
         (wpx, hpx).hash(&mut h);
-        for v in [self.yaw, self.pitch, self.dist, self.target[0], self.target[1], self.target[2]] {
+        for v in [self.yaw, self.pitch, self.dist, self.target[0], self.target[1], self.target[2], pr.shift[0], pr.shift[1], pr.shift[2]] {
             v.to_bits().hash(&mut h);
         }
         for b in &project.bodies {
@@ -438,7 +526,7 @@ impl View3 {
             b.rot.map(f64::to_bits).hash(&mut h);
             b.geo.as_ref().map(|g| std::sync::Arc::as_ptr(g) as usize).hash(&mut h);
         }
-        (ov.selected_body, hover_tint, ov.tints).hash(&mut h);
+        (ov.selected_body, hover_tint, ov.tints, self.red_mask).hash(&mut h);
         let key = h.finish();
         if key != self.key || self.frame.is_none() {
             self.render(project, ov, &pr, rect, wpx, hpx, scale, hover_tint);
@@ -472,6 +560,20 @@ impl View3 {
                 if let (Some(p), Some(q)) = (pr.screen([c[0], c[1], 0.0]), pr.screen([c[0], c[1], top])) {
                     painter.line_segment([p.0, q.0], s);
                 }
+            }
+        }
+        if let Some(w) = wall_hover {
+            let (n, p) = w.plane(&vol);
+            let k = (0..3).find(|&k| n[k] != 0.0).unwrap_or(2);
+            let (i, j) = ((k + 1) % 3, (k + 2) % 3);
+            let corner = |a: usize, b: usize| {
+                let mut c = p;
+                c[i] = if a == 0 { vol[i].0 } else { vol[i].1 };
+                c[j] = if b == 0 { vol[j].0 } else { vol[j].1 };
+                pr.screen(c).map(|s| s.0)
+            };
+            if let [Some(a), Some(b), Some(c), Some(d)] = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)] {
+                painter.add(Shape::convex_polygon(vec![a, b, c, d], Color32::from_rgba_unmultiplied(0x2f, 0x6f, 0xd0, 70), Stroke::new(1.5, Color32::from_rgb(0x2f, 0x6f, 0xd0))));
             }
         }
         // Origin axes.
@@ -535,6 +637,73 @@ impl View3 {
                 painter.text(sp[0], Align2::CENTER_CENTER, (n + 1).to_string(), FontId::proportional(11.0), Color32::BLACK);
             }
         }
+        // Run: the machine box and the rails of the axes that move the tool.
+        if let Some((shift, lo)) = run_state {
+            let f = project.machine.frame_size();
+            let hi = [lo[0] + f[0], lo[1] + f[1], lo[2] + f[2]];
+            let screen = |p: V3| pr.screen([p[0] - shift[0], p[1] - shift[1], p[2] - shift[2]]).map(|s| s.0);
+            let line = |a: V3, b: V3, st: Stroke| {
+                if let (Some(a), Some(b)) = (screen(a), screen(b)) {
+                    painter.line_segment([a, b], st);
+                }
+            };
+            let env = Stroke::new(1.2, Color32::from_rgb(0x6b, 0x77, 0x84));
+            for z in [lo[2], hi[2]] {
+                line([lo[0], lo[1], z], [hi[0], lo[1], z], env);
+                line([hi[0], lo[1], z], [hi[0], hi[1], z], env);
+                line([hi[0], hi[1], z], [lo[0], hi[1], z], env);
+                line([lo[0], hi[1], z], [lo[0], lo[1], z], env);
+            }
+            for (x, y) in [(lo[0], lo[1]), (hi[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1])] {
+                line([x, y, lo[2]], [x, y, hi[2]], env);
+            }
+            // The tool never moves on the screen when the bed carries the axis, so it is
+            // placed from the same displaced coordinates the path uses.
+            let t = ov.run.map(|pv| pv.tool_now().0).unwrap_or([0.0; 3]);
+            let t = [t[0] + shift[0], t[1] + shift[1], t[2] + shift[2]];
+            let rail = Stroke::new(4.0, Color32::from_rgb(0x55, 0x60, 0x6c));
+            let ax = &project.machine.axes;
+            if ax[0] == AxisOwner::EndEffector {
+                line([lo[0], t[1], hi[2]], [hi[0], t[1], hi[2]], rail);
+            }
+            if ax[1] == AxisOwner::EndEffector {
+                line([t[0], lo[1], hi[2]], [t[0], hi[1], hi[2]], rail);
+            }
+            if ax[2] == AxisOwner::EndEffector {
+                line([t[0], t[1], t[2] + 26.0], [t[0], t[1], hi[2]], rail);
+            }
+        }
+        // Run: toolpath (done solid, rest faint) and the tool.
+        if let Some(pv) = ov.run {
+            let accent = crate::common::preview::effector_color(project.machine.effector.kind);
+            let faint = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+            let travel = Color32::from_rgba_unmultiplied(90, 100, 115, 120);
+            let lerp = |a: V3, b: V3, f: f64| [0, 1, 2].map(|k| a[k] + (b[k] - a[k]) * f);
+            for (a, b, work, done) in pv.segments() {
+                if !work && !pv.show_travel {
+                    continue;
+                }
+                let (c_done, c_rest) = if work { (accent, faint) } else { (travel, travel) };
+                let w = if work { 2.5 } else { 1.0 };
+                let mid = lerp(a, b, done);
+                let seg = |p: V3, q: V3, c: Color32, w: f32| {
+                    if let (Some(s), Some(e)) = (pr.screen(p), pr.screen(q)) {
+                        painter.line_segment([s.0, e.0], Stroke::new(w, c));
+                    }
+                };
+                if done > 0.0 {
+                    seg(a, mid, c_done, w);
+                }
+                if done < 1.0 && (pv.show_full || !work) {
+                    seg(mid, b, c_rest, if work { 1.0 } else { w });
+                }
+            }
+            let (tool, working) = pv.tool_now();
+            if let (Some(t), Some(top)) = (pr.screen(tool), pr.screen([tool[0], tool[1], tool[2] + 25.0])) {
+                painter.line_segment([t.0, top.0], Stroke::new(3.0, Color32::from_rgb(0x55, 0x60, 0x6c)));
+                painter.circle_filled(t.0, if working { 5.0 } else { 3.5 }, if working { accent } else { Color32::from_rgb(0x55, 0x60, 0x6c) });
+            }
+        }
         out
     }
 
@@ -550,6 +719,8 @@ impl View3 {
             for (fi, face) in g.faces.iter().enumerate() {
                 let base: [f32; 3] = if hover == Some((bi, fi)) {
                     [255.0, 214.0, 70.0]
+                } else if bi < 64 && self.red_mask >> bi & 1 == 1 {
+                    [214.0, 58.0, 52.0]
                 } else if let Some((_, c)) = ov.tints.iter().find(|t| t.0 == (bi, fi)) {
                     [c[0] as f32, c[1] as f32, c[2] as f32]
                 } else if selected {

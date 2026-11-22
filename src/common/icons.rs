@@ -10,6 +10,8 @@ pub enum Icon {
     Layers,
     Remove,
     Plus,
+    Save,
+    Copy,
     Trash,
     Settings,
     Reverse,
@@ -19,7 +21,6 @@ pub enum Icon {
     Offset,
     TabPrepare,
     TabPath,
-    TabGcode,
     TabSimulation,
 }
 
@@ -101,6 +102,19 @@ fn draw(p: &egui::Painter, c: Pos2, icon: Icon, color: egui::Color32) {
             p.line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], stroke);
             p.line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], stroke);
         }
+        Icon::Save => {
+            // Floppy disk: body, shutter and label.
+            let r = |a: (f32, f32), b: (f32, f32)| egui::Rect::from_min_max(c + Vec2::new(a.0, a.1), c + Vec2::new(b.0, b.1));
+            p.rect_stroke(r((-6.5, -6.5), (6.5, 6.5)), 1.5, stroke, egui::StrokeKind::Middle);
+            p.rect_stroke(r((-3.5, -6.5), (3.0, -2.0)), 0.0, stroke, egui::StrokeKind::Middle);
+            p.rect_stroke(r((-4.0, 1.0), (4.0, 6.5)), 0.0, stroke, egui::StrokeKind::Middle);
+        }
+        Icon::Copy => {
+            // Two sheets, one in front of the other.
+            let r = |a: (f32, f32), b: (f32, f32)| egui::Rect::from_min_max(c + Vec2::new(a.0, a.1), c + Vec2::new(b.0, b.1));
+            p.rect_stroke(r((-2.0, -7.0), (6.5, 3.0)), 1.5, stroke, egui::StrokeKind::Middle);
+            p.rect_stroke(r((-6.5, -3.0), (2.0, 7.0)), 1.5, stroke, egui::StrokeKind::Middle);
+        }
         Icon::Plus => {
             let d = 6.0;
             p.line_segment([c + Vec2::new(-d, 0.0), c + Vec2::new(d, 0.0)], stroke);
@@ -174,12 +188,6 @@ fn draw(p: &egui::Painter, c: Pos2, icon: Icon, color: egui::Color32) {
             for d in pts {
                 p.circle_filled(c + d, 2.0, color);
             }
-        }
-        Icon::TabGcode => {
-            // Angle brackets around a slash.
-            p.add(Shape::line(vec![c + Vec2::new(-3.0, -6.0), c + Vec2::new(-8.0, 0.0), c + Vec2::new(-3.0, 6.0)], stroke));
-            p.add(Shape::line(vec![c + Vec2::new(3.0, -6.0), c + Vec2::new(8.0, 0.0), c + Vec2::new(3.0, 6.0)], stroke));
-            p.line_segment([c + Vec2::new(1.5, -6.0), c + Vec2::new(-1.5, 6.0)], stroke);
         }
         Icon::TabSimulation => {
             // Play triangle in a ring.
