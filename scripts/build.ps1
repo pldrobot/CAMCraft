@@ -5,6 +5,9 @@
     Build a debug binary instead of release.
 .PARAMETER Test
     Run the unit tests before building.
+.PARAMETER Installer
+    Build a release MSI installer (needs the WiX Toolset v3 and `cargo install cargo-wix`).
+    Output: target\wix\*.msi
 .PARAMETER Clean
     Remove build artifacts before building.
 #>
@@ -12,7 +15,8 @@
 param(
     [switch]$DebugBuild,
     [switch]$Test,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Installer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,3 +49,12 @@ Invoke-Cargo @buildArgs
 
 $exe = Join-Path $project "target\$profileDir\camcraft.exe"
 Write-Host "Built: $exe"
+
+if ($Installer) {
+    if ($DebugBuild) { throw '-Installer builds release only, do not combine with -DebugBuild' }
+    if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+        throw 'cargo-wix not found. Run: cargo install cargo-wix (and install WiX Toolset v3)'
+    }
+    Invoke-Cargo wix --nocapture --no-build --manifest-path $manifest
+    Write-Host "MSI: $(Join-Path $project 'target\wix')"
+}

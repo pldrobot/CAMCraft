@@ -2,11 +2,13 @@
 name = "camcraft"
 version = "0.1.0"
 edition = "2024"
+description = "Desktop CAM tool that turns DXF drawings and STEP models into G-code for CNC machines"
 
 [dependencies]
 dirs = "7.0.0"
 dxf = "0.6.2"
 eframe = "0.37.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -15,6 +17,9 @@ truck-meshalgo = "0.4"
 truck-polymesh = "0.6.0"
 truck-stepio = "0.3"
 truck-topology = "0.6.0"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.dev]
 opt-level = 2
@@ -26,3 +31,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "camcraft"
 path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "PLD Industries"
+section = "science"
+priority = "optional"
+depends = "$auto"
+extended-description = "Desktop CAM tool: DXF drawings and STEP models to G-code for generic CNC machines (milling, laser, dispensing)."
+assets = [
+    ["target/release/camcraft", "usr/bin/", "755"],
+    ["assets/icons/png/camcraft-256.png", "usr/share/icons/hicolor/256x256/apps/camcraft.png", "644"],
+    ["assets/icons/png/camcraft-48.png", "usr/share/icons/hicolor/48x48/apps/camcraft.png", "644"],
+    ["packaging/camcraft.desktop", "usr/share/applications/camcraft.desktop", "644"],
+]

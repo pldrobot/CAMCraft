@@ -255,19 +255,19 @@ impl P3App {
             self.tab = Tab::Prepare;
         }
 
-        egui::Panel::top("p3_tabs").show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Prepare, "Prepare");
-                ui.selectable_value(&mut self.tab, Tab::PathSelection, "Path selection");
-                ui.add_enabled_ui(generated, |ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Preview, "Preview").on_disabled_hover_text("Generate G-code first.");
-                    ui.selectable_value(&mut self.tab, Tab::Gcode, "G-code").on_disabled_hover_text("Generate G-code first.");
-                });
-            });
-        });
-
         let mut generate = false;
         egui::Panel::left("p3_left").resizable(false).exact_size(330.0).show(root, |ui| {
+            const ORDER: [Tab; 4] = [Tab::Prepare, Tab::PathSelection, Tab::Preview, Tab::Gcode];
+            let cur = ORDER.iter().position(|t| *t == self.tab).unwrap_or(0);
+            let picked = icons::tab_strip(ui, &[
+                (icons::Icon::TabPrepare, "Prepare", true),
+                (icons::Icon::TabPath, "Path selection", true),
+                (icons::Icon::TabSimulation, "Simulation", generated),
+                (icons::Icon::TabGcode, "G-code", generated),
+            ], cur);
+            if let Some(i) = picked {
+                self.tab = ORDER[i];
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
               self.jobs_ui(ui);
               match self.tab {
@@ -578,6 +578,20 @@ impl P3App {
             if let Some(m) = lib.machines.iter().find(|m| m.name == self.project.machine.name) {
                 self.project.machine = m.clone();
             }
+        }
+        let mut pick: Option<usize> = None;
+        egui::ComboBox::from_id_salt("project_machine")
+            .selected_text(self.project.machine.name.clone())
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                for (i, m) in lib.machines.iter().enumerate() {
+                    if ui.selectable_label(m.name == self.project.machine.name, &m.name).clicked() {
+                        pick = Some(i);
+                    }
+                }
+            });
+        if let Some(m) = pick.and_then(|i| lib.machines.get(i)) {
+            self.project.machine = m.clone();
         }
         let m = &self.project.machine;
         ui.label(format!("{}   bed {} x {} x {} mm", m.name, m.bed_x, m.bed_y, m.bed_z));

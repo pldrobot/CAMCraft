@@ -118,20 +118,23 @@ impl App {
             return;
         }
         if self.project.is_none() {
-            egui::CentralPanel::default().show(root, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() * 0.35);
-                    ui.heading("CAMCraft");
-                    ui.label("Path programming for CNC machines");
-                    ui.add_space(12.0);
-                    if ui.button("New Project...").clicked() {
-                        actions.push(Action::NewProject);
-                    }
-                    if ui.button("Open Project...").clicked() {
-                        actions.push(Action::OpenProject);
+            // Empty workspace: the same layout as a project, disabled, with the welcome window on top.
+            egui::Panel::left("empty_left").resizable(false).exact_size(330.0).show(root, |ui| {
+                ui.add_enabled_ui(false, |ui| {
+                    icons::tab_strip(ui, &[
+                        (icons::Icon::TabPrepare, "Prepare", true),
+                        (icons::Icon::TabPath, "Path selection", true),
+                        (icons::Icon::TabSimulation, "Simulation", true),
+                        (icons::Icon::TabGcode, "G-code", true),
+                    ], 0);
+                    for h in ["Parts", "Job settings", "Sequence"] {
+                        ui.collapsing(h, |ui| {
+                            ui.label("-");
+                        });
                     }
                 });
             });
+            egui::CentralPanel::default().show(root, |_| {});
             return;
         }
 
@@ -142,19 +145,6 @@ impl App {
             *tab = ProjectTab::Prepare;
         }
 
-        egui::Panel::top("project_tabs").show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(tab, ProjectTab::Prepare, "Prepare");
-                ui.selectable_value(tab, ProjectTab::PathSelection, "Path selection");
-                ui.add_enabled_ui(generated, |ui| {
-                    ui.selectable_value(tab, ProjectTab::Preview, "Preview")
-                        .on_disabled_hover_text("Generate G-code first.");
-                    ui.selectable_value(tab, ProjectTab::Gcode, "G-code")
-                        .on_disabled_hover_text("Generate G-code first.");
-                });
-            });
-        });
-
         match *tab {
             ProjectTab::Prepare => canvas.tool = Tool::Move,
             ProjectTab::PathSelection => canvas.tool = Tool::Sequence,
@@ -162,6 +152,17 @@ impl App {
         }
 
         egui::Panel::left("left").resizable(false).exact_size(330.0).show(root, |ui| {
+            const ORDER: [ProjectTab; 4] = [ProjectTab::Prepare, ProjectTab::PathSelection, ProjectTab::Preview, ProjectTab::Gcode];
+            let cur = ORDER.iter().position(|t| *t == *tab).unwrap_or(0);
+            let picked = icons::tab_strip(ui, &[
+                (icons::Icon::TabPrepare, "Prepare", true),
+                (icons::Icon::TabPath, "Path selection", true),
+                (icons::Icon::TabSimulation, "Simulation", generated),
+                (icons::Icon::TabGcode, "G-code", generated),
+            ], cur);
+            if let Some(i) = picked {
+                *tab = ORDER[i];
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match *tab {
                     ProjectTab::Prepare => {
@@ -182,6 +183,21 @@ impl App {
                                 project.job = m.job.clone();
                                 project.machine = m.clone();
                             }
+                        }
+                        let mut pick: Option<usize> = None;
+                        egui::ComboBox::from_id_salt("project_machine")
+                            .selected_text(project.machine.name.clone())
+                            .width(ui.available_width() - 8.0)
+                            .show_ui(ui, |ui| {
+                                for (i, m) in lib.machines.iter().enumerate() {
+                                    if ui.selectable_label(m.name == project.machine.name, &m.name).clicked() {
+                                        pick = Some(i);
+                                    }
+                                }
+                            });
+                        if let Some(m) = pick.and_then(|i| lib.machines.get(i)) {
+                            project.job = m.job.clone();
+                            project.machine = m.clone();
                         }
                         let m = &project.machine;
                         ui.label(format!(

@@ -17,6 +17,10 @@ pub enum Icon {
     SelFace,
     SelPoint,
     Offset,
+    TabPrepare,
+    TabPath,
+    TabGcode,
+    TabSimulation,
 }
 
 pub fn icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
@@ -155,6 +159,34 @@ fn draw(p: &egui::Painter, c: Pos2, icon: Icon, color: egui::Color32) {
             p.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, 6.0)], stroke);
             p.circle_filled(c, 2.2, color);
         }
+        Icon::TabPrepare => {
+            // Feature tree: three indented rows with bullets.
+            for (i, x) in [-7.0_f32, -3.0, -3.0].iter().enumerate() {
+                let y = -6.0 + 6.0 * i as f32;
+                p.circle_filled(c + Vec2::new(*x, y), 1.6, color);
+                p.line_segment([c + Vec2::new(*x + 4.0, y), c + Vec2::new(8.0, y)], stroke);
+            }
+        }
+        Icon::TabPath => {
+            // Polyline path with a node at each corner.
+            let pts = [Vec2::new(-7.0, 6.0), Vec2::new(-2.0, -4.0), Vec2::new(3.0, 3.0), Vec2::new(8.0, -6.0)];
+            p.add(Shape::line(pts.iter().map(|d| c + *d).collect(), stroke));
+            for d in pts {
+                p.circle_filled(c + d, 2.0, color);
+            }
+        }
+        Icon::TabGcode => {
+            // Angle brackets around a slash.
+            p.add(Shape::line(vec![c + Vec2::new(-3.0, -6.0), c + Vec2::new(-8.0, 0.0), c + Vec2::new(-3.0, 6.0)], stroke));
+            p.add(Shape::line(vec![c + Vec2::new(3.0, -6.0), c + Vec2::new(8.0, 0.0), c + Vec2::new(3.0, 6.0)], stroke));
+            p.line_segment([c + Vec2::new(1.5, -6.0), c + Vec2::new(-1.5, 6.0)], stroke);
+        }
+        Icon::TabSimulation => {
+            // Play triangle in a ring.
+            p.circle_stroke(c, 8.0, stroke);
+            let tri = vec![c + Vec2::new(-2.5, -4.0), c + Vec2::new(-2.5, 4.0), c + Vec2::new(4.0, 0.0)];
+            p.add(Shape::convex_polygon(tri, color, Stroke::NONE));
+        }
         Icon::Offset => {
             // Two lines with a double arrow between them.
             p.line_segment([c + Vec2::new(-7.0, -6.0), c + Vec2::new(-7.0, 6.0)], stroke);
@@ -166,4 +198,42 @@ fn draw(p: &egui::Painter, c: Pos2, icon: Icon, color: egui::Color32) {
             }
         }
     }
+}
+
+/// SolidWorks style icon tab strip. Each tab is (icon, name, enabled). Returns the tab that
+/// was clicked this frame.
+pub fn tab_strip(ui: &mut Ui, tabs: &[(Icon, &str, bool)], current: usize) -> Option<usize> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (i, (icon, name, enabled)) in tabs.iter().enumerate() {
+            let sense = if *enabled { Sense::click() } else { Sense::hover() };
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(40.0, 32.0), sense);
+            let selected = i == current;
+            if *enabled && (selected || resp.hovered()) {
+                ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            }
+            let fg = ui.visuals().widgets.inactive.fg_stroke.color;
+            let color = if !*enabled {
+                fg.gamma_multiply(0.35)
+            } else if selected {
+                theme::PATH_PART_SELECTED
+            } else {
+                fg
+            };
+            draw(ui.painter(), rect.center(), *icon, color);
+            if selected {
+                ui.painter().line_segment(
+                    [rect.left_bottom() + Vec2::new(4.0, -1.0), rect.right_bottom() + Vec2::new(-4.0, -1.0)],
+                    Stroke::new(2.0, color),
+                );
+            }
+            let resp = if *enabled { resp.on_hover_text(*name) } else { resp.on_hover_text(format!("{name} (generate G-code first)")) };
+            if resp.clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    ui.separator();
+    clicked
 }

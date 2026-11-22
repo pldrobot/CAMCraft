@@ -94,7 +94,7 @@ impl EffectorKind {
         match self {
             EffectorKind::Motor => "Motor",
             EffectorKind::Laser => "Laser",
-            EffectorKind::Glue => "Glue",
+            EffectorKind::Glue => "Dispenser",
             EffectorKind::Other => "Other",
         }
     }

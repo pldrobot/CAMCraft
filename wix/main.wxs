@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!-- WiX v3 installer, built by scripts/build.ps1 -Installer (cargo wix). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="CAMCraft" Language="1033" Version="$(var.Version)"
+           Manufacturer="PLD Industries" UpgradeCode="5D2CA50D-7482-4CED-A928-C682F8C2736D">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="$(var.Platform)"
+             Description="CAMCraft, path programming for CNC machines" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CAMCraft is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="camcraft.ico" SourceFile="assets\icons\camcraft.ico" />
+    <Property Id="ARPPRODUCTICON" Value="camcraft.ico" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="CAMCraft" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <DirectoryRef Id="APPLICATIONFOLDER">
+      <Component Id="MainExe" Guid="*" Win64="$(var.Win64)">
+        <File Id="CamcraftExe" Source="$(var.CargoTargetBinDir)\camcraft.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartShortcut" Guid="*" Win64="$(var.Win64)">
+        <Shortcut Id="StartMenuShortcut" Name="CAMCraft" Description="CAMCraft"
+                  Target="[APPLICATIONFOLDER]camcraft.exe" WorkingDirectory="APPLICATIONFOLDER"
+                  Icon="camcraft.ico" />
+        <RegistryValue Root="HKCU" Key="Software\CAMCraft" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Complete" Title="CAMCraft" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="StartShortcut" />
+    </Feature>
+  </Product>
+</Wix>

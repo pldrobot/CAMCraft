@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=CAMCraft
+Comment=Path programming for CNC machines
+Exec=camcraft
+Icon=camcraft
+Categories=Graphics;Engineering;
+Terminal=false

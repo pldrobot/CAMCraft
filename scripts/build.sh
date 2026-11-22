@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds CAMCraft with cargo.
-# Usage: ./build.sh [--debug] [--test] [--clean]
+# Usage: ./build.sh [--debug] [--test] [--clean] [--deb]
+# --deb builds a release .deb in target/debian (needs: cargo install cargo-deb)
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,14 +11,16 @@ manifest="$project/Cargo.toml"
 profile="release"
 run_test=0
 clean=0
+deb=0
 
 for arg in "$@"; do
     case "$arg" in
         --debug) profile="debug" ;;
         --test)  run_test=1 ;;
         --clean) clean=1 ;;
+        --deb)   deb=1 ;;
         -h|--help)
-            echo "Usage: $0 [--debug] [--test] [--clean]"
+            echo "Usage: $0 [--debug] [--test] [--clean] [--deb]"
             exit 0
             ;;
         *) echo "Unknown option: $arg" >&2; exit 1 ;;
@@ -39,3 +42,10 @@ fi
 exe="$project/target/$profile/camcraft"
 [ -f "$exe.exe" ] && exe="$exe.exe"
 echo "Built: $exe"
+
+if [ "$deb" -eq 1 ]; then
+    [ "$profile" = "release" ] || { echo "--deb builds release only, do not combine with --debug" >&2; exit 1; }
+    command -v cargo-deb >/dev/null 2>&1 || { echo "cargo-deb not found. Run: cargo install cargo-deb" >&2; exit 1; }
+    cargo deb --manifest-path "$manifest" --no-build
+    echo "Built: $(ls "$project"/target/debian/*.deb)"
+fi
