@@ -19,7 +19,7 @@ Needs the Rust toolchain (rustup). Or use `scripts/build.ps1` (Windows) or `scri
 
 ## Installers (release builds)
 
-- Windows MSI: `scripts/build.ps1 -Installer` (needs WiX Toolset v3 and `cargo install cargo-wix`). Output in `target/wix`.
+- Windows MSI: `scripts/build.ps1 -Installer` (WiX 3 is downloaded to `tools/wix3` on first run). Output in `dist/`.
 - Linux .deb: `scripts/build.sh --deb` (needs `cargo install cargo-deb`). Output in `target/debian`.
 
 Branding assets are in `assets/`. Release builds on Windows open without a console window.

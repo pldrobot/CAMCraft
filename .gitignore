@@ -2,3 +2,5 @@ target/
 .claude/
 CLAUDE.md
 graphify-out/
+tools/
+dist/

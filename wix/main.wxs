@@ -1,40 +1,95 @@
-<?xml version="1.0" encoding="windows-1252"?>
-<!-- WiX v3 installer, built by scripts/build.ps1 -Installer (cargo wix). -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX 3 MSI, built by scripts\build.ps1 -Installer (candle + light).
+  Pages: Welcome > Install folder > Shortcuts > Ready > Progress > Finish (launch checkbox).
+  Silent install: msiexec /i CAMCraft-x.y.z-x64.msi /qn INSTALL_STARTMENU=0 INSTALL_DESKTOP=0
+-->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="CAMCraft" Language="1033" Version="$(var.Version)"
            Manufacturer="PLD Industries" UpgradeCode="5D2CA50D-7482-4CED-A928-C682F8C2736D">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="$(var.Platform)"
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             InstallPrivileges="elevated" Platform="x64"
              Description="CAMCraft, path programming for CNC machines" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of CAMCraft is already installed." />
-    <MediaTemplate EmbedCab="yes" />
-    <Icon Id="camcraft.ico" SourceFile="assets\icons\camcraft.ico" />
-    <Property Id="ARPPRODUCTICON" Value="camcraft.ico" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+
+    <!-- Defaults for the Shortcuts page -->
+    <Property Id="INSTALL_STARTMENU" Value="1" />
+    <Property Id="INSTALL_DESKTOP" Value="1" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="APPLICATIONFOLDER" Name="CAMCraft" />
+        <Directory Id="INSTALLFOLDER" Name="CAMCraft" />
       </Directory>
       <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
     </Directory>
 
-    <DirectoryRef Id="APPLICATIONFOLDER">
-      <Component Id="MainExe" Guid="*" Win64="$(var.Win64)">
-        <File Id="CamcraftExe" Source="$(var.CargoTargetBinDir)\camcraft.exe" KeyPath="yes" />
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="AppExe" Guid="*" Win64="yes">
+        <File Id="CamcraftExe" Source="$(var.ExePath)" KeyPath="yes" />
       </Component>
     </DirectoryRef>
-
     <DirectoryRef Id="ProgramMenuFolder">
-      <Component Id="StartShortcut" Guid="*" Win64="$(var.Win64)">
-        <Shortcut Id="StartMenuShortcut" Name="CAMCraft" Description="CAMCraft"
-                  Target="[APPLICATIONFOLDER]camcraft.exe" WorkingDirectory="APPLICATIONFOLDER"
-                  Icon="camcraft.ico" />
-        <RegistryValue Root="HKCU" Key="Software\CAMCraft" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
+      <Component Id="StartMenuShortcut" Guid="*" Win64="yes">
+        <Condition>INSTALL_STARTMENU = "1"</Condition>
+        <Shortcut Id="StartMenuLink" Name="CAMCraft" Target="[INSTALLFOLDER]camcraft.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\PLDIndustries\CAMCraft" Name="startmenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*" Win64="yes">
+        <Condition>INSTALL_DESKTOP = "1"</Condition>
+        <Shortcut Id="DesktopLink" Name="CAMCraft" Target="[INSTALLFOLDER]camcraft.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\PLDIndustries\CAMCraft" Name="desktop"
+                       Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
-    <Feature Id="Complete" Title="CAMCraft" Level="1">
-      <ComponentRef Id="MainExe" />
-      <ComponentRef Id="StartShortcut" />
+    <Feature Id="Main" Title="CAMCraft" Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
+
+    <!-- UI -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch CAMCraft" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <UIRef Id="WixUI_InstallDir" />
+    <UI>
+      <Dialog Id="ShortcutsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="340" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose how CAMCraft is added to your system." />
+        <Control Id="StartMenuCb" Type="CheckBox" X="25" Y="64" Width="320" Height="18" Property="INSTALL_STARTMENU" CheckBoxValue="1" Text="Add a &amp;Start menu shortcut" />
+        <Control Id="DesktopCb" Type="CheckBox" X="25" Y="90" Width="320" Height="18" Property="INSTALL_DESKTOP" CheckBoxValue="1" Text="Add a &amp;Desktop shortcut" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="InstallDirDlg">1</Publish>
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg">1</Publish>
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg">1</Publish>
+        </Control>
+      </Dialog>
+
+      <!-- Skip the license page; add the Shortcuts page after the folder page -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="5">NOT Installed</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="5">1</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ShortcutsDlg" Order="5">WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID="1"</Publish>
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ShortcutsDlg" Order="5">NOT Installed</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
+    </UI>
+    <CustomAction Id="LaunchApp" FileKey="CamcraftExe" ExeCommand="" Return="asyncNoWait" />
   </Product>
 </Wix>

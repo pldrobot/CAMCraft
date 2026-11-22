@@ -6,8 +6,8 @@
 .PARAMETER Test
     Run the unit tests before building.
 .PARAMETER Installer
-    Build a release MSI installer (needs the WiX Toolset v3 and `cargo install cargo-wix`).
-    Output: target\wix\*.msi
+    Build a release MSI installer. WiX 3.14 binaries are downloaded to tools\wix3 on first run.
+    Output: dist\CAMCraft-<version>-x64.msi
 .PARAMETER Clean
     Remove build artifacts before building.
 #>
@@ -23,6 +23,10 @@ $ErrorActionPreference = 'Stop'
 
 $project = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $project 'Cargo.toml'
+
+# Admin or fresh shells may not have the rustup folder on PATH.
+$cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+if ((Test-Path $cargoBin) -and ($env:PATH -notlike "*$cargoBin*")) { $env:PATH = "$cargoBin;$env:PATH" }
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw 'cargo not found. Install the Rust toolchain from https://rustup.rs'
@@ -52,9 +56,25 @@ Write-Host "Built: $exe"
 
 if ($Installer) {
     if ($DebugBuild) { throw '-Installer builds release only, do not combine with -DebugBuild' }
-    if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
-        throw 'cargo-wix not found. Run: cargo install cargo-wix (and install WiX Toolset v3)'
+    $version = (Select-String -Path $manifest -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+
+    $wix = Join-Path $project 'tools\wix3'
+    if (-not (Test-Path "$wix\candle.exe")) {
+        Write-Host 'Downloading WiX 3.14 binaries ...'
+        New-Item -ItemType Directory -Force $wix | Out-Null
+        $zip = Join-Path $wix 'wix314-binaries.zip'
+        Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+        Expand-Archive $zip -DestinationPath $wix -Force
     }
-    Invoke-Cargo wix --nocapture --no-build --manifest-path $manifest
-    Write-Host "MSI: $(Join-Path $project 'target\wix')"
+
+    $dist = Join-Path $project 'dist'
+    New-Item -ItemType Directory -Force $dist | Out-Null
+    $obj = Join-Path $dist 'main.wixobj'
+    $msi = Join-Path $dist "CAMCraft-$version-x64.msi"
+    & "$wix\candle.exe" -nologo -arch x64 "-dVersion=$version" "-dExePath=$exe" `
+        "-dIconPath=$project\assets\icons\camcraft.ico" -out $obj (Join-Path $project 'wix\main.wxs')
+    if ($LASTEXITCODE) { throw 'candle failed' }
+    & "$wix\light.exe" -nologo -ext WixUIExtension -sice:ICE38 -sice:ICE43 -sice:ICE57 -sice:ICE64 -o $msi $obj
+    if ($LASTEXITCODE) { throw 'light failed' }
+    Write-Host "Built: $msi"
 }
