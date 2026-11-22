@@ -3,7 +3,8 @@ use crate::common::theme;
 use eframe::egui;
 use egui::{Align2, Color32, FontId, RichText, Sense, Stroke, Vec2};
 
-const TILE: Vec2 = Vec2::new(226.0, 54.0);
+const TILE: Vec2 = Vec2::new(146.0, 124.0);
+const THUMB: Vec2 = Vec2::new(146.0, 82.0);
 
 impl App {
     /// Start window shown over the empty workspace: start commands on the left, recent projects
@@ -12,6 +13,18 @@ impl App {
         let empty = self.project.is_none() && self.p3.is_none();
         if !empty || self.screen != Screen::Project || self.welcome_closed {
             return;
+        }
+        for path in self.recent.0.clone() {
+            if !self.thumbs.contains_key(&path) {
+                let tex = super::thumb::file_for(&path)
+                    .and_then(|f| image::open(f).ok())
+                    .map(|im| {
+                        let im = im.to_rgba8();
+                        let img = egui::ColorImage::from_rgba_unmultiplied([im.width() as usize, im.height() as usize], im.as_raw());
+                        ctx.load_texture(format!("thumb-{}", path.display()), img, egui::TextureOptions::LINEAR)
+                    });
+                self.thumbs.insert(path, tex);
+            }
         }
         let mut open = true;
         let frame = egui::Frame::window(&ctx.global_style()).fill(theme::UI_PANEL).inner_margin(0.0);
@@ -59,7 +72,8 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = Vec2::splat(8.0);
                                 for path in &self.recent.0 {
-                                    if recent_tile(ui, path).clicked() {
+                                    let tex = self.thumbs.get(path).and_then(|t| t.as_ref());
+                                    if recent_tile(ui, path, tex).clicked() {
                                         actions.push(Action::OpenPath(path.clone()));
                                     }
                                 }
@@ -121,24 +135,29 @@ fn start_item(ui: &mut egui::Ui, title: &str, hint: &str) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn recent_tile(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
+fn recent_tile(ui: &mut egui::Ui, path: &std::path::Path, thumb: Option<&egui::TextureHandle>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(TILE, Sense::click());
     let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let is3d = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("camcraft3d"));
-    let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
     let p = ui.painter();
     let (fill, stroke) = if resp.hovered() { (theme::UI_HOVER, theme::ACCENT) } else { (theme::UI_WIDGET, theme::UI_BORDER) };
     p.rect(rect, 2.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-    // Badge with the project kind.
-    let badge = egui::Rect::from_min_size(rect.left_top() + Vec2::new(8.0, 9.0), Vec2::new(36.0, 36.0));
+    let img = egui::Rect::from_min_size(rect.min + Vec2::splat(1.0), THUMB - Vec2::splat(2.0));
+    match thumb {
+        Some(t) => {
+            p.image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            p.rect_filled(img, 0.0, theme::UI_DEEP);
+            p.text(img.center(), Align2::CENTER_CENTER, if is3d { "3D" } else { "2D" }, FontId::proportional(22.0), theme::UI_TEXT_WEAK);
+        }
+    }
+    // Small badge with the project kind.
+    let badge = egui::Rect::from_min_size(img.right_top() + Vec2::new(-30.0, 4.0), Vec2::new(26.0, 16.0));
     p.rect_filled(badge, 2.0, if is3d { theme::ACCENT } else { Color32::from_rgb(0x2d, 0x8a, 0x5e) });
-    p.text(badge.center(), Align2::CENTER_CENTER, if is3d { "3D" } else { "2D" }, FontId::proportional(14.0), Color32::WHITE);
-    let tx = rect.left() + 54.0;
-    let max_chars = 26;
-    let short = |s: &str| if s.chars().count() > max_chars { format!("{}...", s.chars().take(max_chars - 3).collect::<String>()) } else { s.to_string() };
-    p.text(egui::pos2(tx, rect.top() + 10.0), Align2::LEFT_TOP, short(&name), FontId::proportional(13.5), Color32::WHITE);
-    let tail: String = dir.chars().rev().take(max_chars).collect::<Vec<_>>().into_iter().rev().collect();
-    let dir_txt = if dir.chars().count() > max_chars { format!("...{tail}") } else { dir };
-    p.text(egui::pos2(tx, rect.top() + 30.0), Align2::LEFT_TOP, dir_txt, FontId::proportional(11.0), theme::UI_TEXT_WEAK);
+    p.text(badge.center(), Align2::CENTER_CENTER, if is3d { "3D" } else { "2D" }, FontId::proportional(11.0), Color32::WHITE);
+    let max_chars = 21;
+    let name = if name.chars().count() > max_chars { format!("{}...", name.chars().take(max_chars - 3).collect::<String>()) } else { name };
+    p.text(egui::pos2(rect.left() + 8.0, rect.top() + 91.0), Align2::LEFT_TOP, name, FontId::proportional(13.0), Color32::WHITE);
     resp.on_hover_text(path.display().to_string()).on_hover_cursor(egui::CursorIcon::PointingHand)
 }

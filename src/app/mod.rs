@@ -10,6 +10,7 @@ use egui::{Color32, RichText};
 use std::path::PathBuf;
 
 mod recent;
+mod thumb;
 mod welcome;
 
 pub fn run() -> eframe::Result {
@@ -99,6 +100,8 @@ pub(crate) struct App {
     pub(crate) p3: Option<p3d::ui::P3App>,
     pub(crate) recent: recent::Recent,
     pub(crate) logo: Option<egui::TextureHandle>,
+    /// Preview textures of recent projects, loaded when the welcome window shows them.
+    pub(crate) thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
     /// The welcome window was closed with its X.
     pub(crate) welcome_closed: bool,
 }
@@ -142,6 +145,7 @@ impl App {
             p3: None,
             recent: recent::Recent::load(),
             logo,
+            thumbs: Default::default(),
             welcome_closed: false,
         }
     }
@@ -207,6 +211,8 @@ impl App {
                 if let Some(p3) = &mut self.p3 {
                     p3.save(as_new);
                     if let Some(path) = p3.path.clone() {
+                        thumb::save(&path, &thumb::render_3d(&p3.project));
+                        self.thumbs.remove(&path);
                         self.recent.add(path);
                     }
                     return;
@@ -221,12 +227,15 @@ impl App {
                     self.project_path.clone()
                 };
                 let Some(path) = path else { return };
+                let preview = thumb::render_2d(project);
                 let res = serde_json::to_string_pretty(project)
                     .map_err(|e| e.to_string())
                     .and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string()));
                 match res {
                     Ok(()) => {
                         self.say(format!("Saved {}", path.display()));
+                        thumb::save(&path, &preview);
+                        self.thumbs.remove(&path);
                         self.recent.add(path.clone());
                         self.project_path = Some(path);
                     }
