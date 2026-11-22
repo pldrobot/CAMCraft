@@ -98,6 +98,7 @@ pub(crate) struct App {
     /// The open 3D project. Only one of `project` and `p3` is Some.
     pub(crate) p3: Option<p3d::ui::P3App>,
     pub(crate) recent: recent::Recent,
+    pub(crate) logo: Option<egui::TextureHandle>,
     /// The welcome window was closed with its X.
     pub(crate) welcome_closed: bool,
 }
@@ -115,6 +116,11 @@ impl App {
                 let img = egui::ColorImage::from_rgba_unmultiplied(size, im.as_raw());
                 (cc.egui_ctx.load_texture("splash", img, egui::TextureOptions::LINEAR), None)
             });
+        let logo = image::load_from_memory(include_bytes!("../../assets/icons/png/camcraft-256.png")).ok().map(|im| {
+            let im = im.to_rgba8();
+            let img = egui::ColorImage::from_rgba_unmultiplied([im.width() as usize, im.height() as usize], im.as_raw());
+            cc.egui_ctx.load_texture("logo", img, egui::TextureOptions::LINEAR)
+        });
         Self {
             splash,
             lib,
@@ -135,6 +141,7 @@ impl App {
             seq_drag: None,
             p3: None,
             recent: recent::Recent::load(),
+            logo,
             welcome_closed: false,
         }
     }
