@@ -40,6 +40,10 @@ function Invoke-Cargo {
     if ($LASTEXITCODE -ne 0) { throw "cargo $($args -join ' ') failed with exit code $LASTEXITCODE" }
 }
 
+# Windows cannot replace an exe that is running.
+$running = Get-Process camcraft -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$project\target\*" }
+if ($running) { throw "CAMCraft is running from target\ (PID $($running.Id -join ', ')). Close it and build again." }
+
 if ($Clean) { Invoke-Cargo clean --manifest-path $manifest }
 if ($Test)  { Invoke-Cargo test --manifest-path $manifest }
 
