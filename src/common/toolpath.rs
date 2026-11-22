@@ -5,4 +5,6 @@ pub struct Move {
     pub to: [f64; 3],
     /// True while the end effector is on.
     pub work: bool,
+    /// 0-based G-code line that makes this move, for the live line display.
+    pub line: usize,
 }

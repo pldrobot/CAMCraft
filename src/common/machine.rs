@@ -68,6 +68,45 @@ impl Default for GcodeStyle {
     }
 }
 
+/// Controller firmware. Decides dwell units and the serial defaults.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Firmware {
+    #[default]
+    Grbl,
+    Marlin,
+    LinuxCnc,
+}
+
+impl Firmware {
+    pub const ALL: [Firmware; 3] = [Firmware::Grbl, Firmware::Marlin, Firmware::LinuxCnc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Firmware::Grbl => "GRBL",
+            Firmware::Marlin => "Marlin",
+            Firmware::LinuxCnc => "LinuxCNC",
+        }
+    }
+
+    pub fn default_baud(self) -> u32 {
+        match self {
+            Firmware::Marlin => 250_000,
+            _ => 115_200,
+        }
+    }
+
+    pub fn default_dwell(self) -> &'static str {
+        match self {
+            Firmware::Marlin => "G4 P{ms}",
+            _ => "G4 P{s}",
+        }
+    }
+}
+
+fn default_baud() -> u32 {
+    115_200
+}
+
 fn default_pre_script() -> String {
     "G21\nG90\nG94".into()
 }
@@ -183,12 +222,18 @@ pub struct Machine {
     pub bed_y: f64,
     #[serde(alias = "size_z")]
     pub bed_z: f64,
-    /// Travel of each axis. 0 means "same as the bed" (old files).
+    /// Lowest and highest position of each axis. Travel is the difference. When both are
+    /// 0 (old files) the legacy lengths below, or the bed size, are used.
     #[serde(default)]
+    pub travel_min: [f64; 3],
+    #[serde(default)]
+    pub travel_max: [f64; 3],
+    /// Old files stored only the travel length. Read, never written.
+    #[serde(default, skip_serializing)]
     pub travel_x: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub travel_y: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub travel_z: f64,
     /// Which part each axis (X, Y, Z) moves: the end effector or the bed.
     #[serde(default)]
@@ -213,6 +258,12 @@ pub struct Machine {
     pub post_script: String,
     #[serde(default)]
     pub gcode: GcodeStyle,
+    /// Old libraries have no firmware: they load as GRBL.
+    #[serde(default)]
+    pub firmware: Firmware,
+    /// Serial speed used when connecting.
+    #[serde(default = "default_baud")]
+    pub baud: u32,
     /// Speeds and other defaults for new projects.
     #[serde(default)]
     pub job: JobSettings,
@@ -229,9 +280,11 @@ impl Machine {
             bed_x: 150.0,
             bed_y: 100.0,
             bed_z: 20.0,
-            travel_x: 150.0,
-            travel_y: 100.0,
-            travel_z: 50.0,
+            travel_min: [0.0; 3],
+            travel_max: [150.0, 100.0, 50.0],
+            travel_x: 0.0,
+            travel_y: 0.0,
+            travel_z: 0.0,
             axes: [AxisOwner::EndEffector; 3],
             effector: EndEffector::default(),
             bed_pos: auto3(),
@@ -240,19 +293,57 @@ impl Machine {
             pre_script: default_pre_script(),
             post_script: default_post_script(),
             gcode: GcodeStyle::default(),
+            firmware: Firmware::default(),
+            baud: default_baud(),
             job: JobSettings::default(),
         }
+    }
+
+    /// Switch firmware and apply its defaults (the user can edit them after).
+    pub fn set_firmware(&mut self, f: Firmware) {
+        self.firmware = f;
+        self.baud = f.default_baud();
+        self.gcode.dwell = f.default_dwell().into();
     }
 
     pub fn bed(&self) -> [f64; 3] {
         [self.bed_x, self.bed_y, self.bed_z]
     }
 
-    /// Axis travel, falling back to the bed size when not set.
+    /// Lowest and highest position of axis `i`.
+    pub fn travel_range(&self, i: usize) -> (f64, f64) {
+        if self.travel_max[i] > self.travel_min[i] {
+            return (self.travel_min[i], self.travel_max[i]);
+        }
+        let legacy = [self.travel_x, self.travel_y, self.travel_z][i];
+        (0.0, if legacy > 0.0 { legacy } else { self.bed()[i] })
+    }
+
+    /// Axis travel (highest minus lowest position).
     pub fn travel(&self) -> [f64; 3] {
-        let t = [self.travel_x, self.travel_y, self.travel_z];
-        let b = self.bed();
-        [0, 1, 2].map(|i| if t[i] > 0.0 { t[i] } else { b[i] })
+        [0, 1, 2].map(|i| {
+            let (lo, hi) = self.travel_range(i);
+            hi - lo
+        })
+    }
+
+    /// Everything the tool can reach in G-code coordinates, bed or not: the full travel of
+    /// each axis. X and Y are placed relative to the bed through the workable area.
+    pub fn tool_range(&self) -> [(f64, f64); 3] {
+        let (t, w, bp, ep) = (self.travel(), self.workable_on_bed(), self.bed_position(), self.effector_position());
+        [0, 1, 2].map(|i| {
+            if i == 2 {
+                // A tool that rides on Z reaches the box top only above the bed thickness.
+                let top = if self.axes[2] == AxisOwner::EndEffector { t[2] - bp[2] } else { t[2] };
+                return (0.0, top.max(0.0));
+            }
+            let lo_bed = match self.axes[i] {
+                AxisOwner::Bed => ep[i] - t[i],
+                AxisOwner::EndEffector => -bp[i],
+            };
+            let lo = lo_bed - w[i].0;
+            (lo, lo + t[i])
+        })
     }
 
     /// Where the end effector sits after homing, in G-code coordinates.
@@ -393,5 +484,30 @@ impl Library {
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(p, s).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod firmware_tests {
+    use super::*;
+
+    #[test]
+    fn old_machine_loads_as_grbl() {
+        let mut v = serde_json::to_value(Machine::new("m")).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("firmware");
+        o.remove("baud");
+        let m: Machine = serde_json::from_value(v).unwrap();
+        assert_eq!(m.firmware, Firmware::Grbl);
+        assert_eq!(m.baud, 115_200);
+    }
+
+    #[test]
+    fn firmware_applies_defaults() {
+        let mut m = Machine::new("m");
+        m.set_firmware(Firmware::Marlin);
+        assert_eq!((m.baud, m.gcode.dwell.as_str()), (250_000, "G4 P{ms}"));
+        m.set_firmware(Firmware::Grbl);
+        assert_eq!((m.baud, m.gcode.dwell.as_str()), (115_200, "G4 P{s}"));
     }
 }

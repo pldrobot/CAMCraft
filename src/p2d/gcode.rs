@@ -54,9 +54,9 @@ pub fn generate(project: &Project) -> GcodeResult {
     let mut moves: Vec<Move> = vec![];
     let home = m.home_position();
     let mut cur = [home[0], home[1], if job.use_z { home[2] } else { 0.0 }];
-    let push_move = |moves: &mut Vec<Move>, cur: &mut [f64; 3], to: [f64; 3], work: bool| {
+    let push_move = |moves: &mut Vec<Move>, cur: &mut [f64; 3], to: [f64; 3], work: bool, line: usize| {
         if (0..3).any(|i| (cur[i] - to[i]).abs() > 1e-9) {
-            moves.push(Move { from: *cur, to, work });
+            moves.push(Move { from: *cur, to, work, line });
         }
         *cur = to;
     };
@@ -133,15 +133,15 @@ pub fn generate(project: &Project) -> GcodeResult {
             if job.use_z {
                 out.push(format!("{} Z{}{}", st.rapid_cmd, num(job.safe_z, d), rapid_f));
                 let c = cur;
-                push_move(&mut moves, &mut cur, [c[0], c[1], job.safe_z], false);
+                push_move(&mut moves, &mut cur, [c[0], c[1], job.safe_z], false, out.len().saturating_sub(1));
             }
             out.push(format!("{} X{} Y{}{}", st.rapid_cmd, num(x, d), num(y, d), rapid_f));
             let c = cur;
-            push_move(&mut moves, &mut cur, [x, y, c[2]], false);
+            push_move(&mut moves, &mut cur, [x, y, c[2]], false, out.len().saturating_sub(1));
             if let Some(z) = z {
                 out.push(format!("{} Z{}{}", st.rapid_cmd, num(z, d), rapid_f));
                 let c = cur;
-                push_move(&mut moves, &mut cur, [c[0], c[1], z], false);
+                push_move(&mut moves, &mut cur, [c[0], c[1], z], false, out.len().saturating_sub(1));
             }
             continue;
         }
@@ -168,8 +168,8 @@ pub fn generate(project: &Project) -> GcodeResult {
         }
         let z_work = if job.use_z { job.dispense_z } else { cur[2] };
         let z_safe = if job.use_z { job.safe_z } else { cur[2] };
-        { let c = cur; push_move(&mut moves, &mut cur, [c[0], c[1], z_safe], false); }
-        push_move(&mut moves, &mut cur, [pts[0][0], pts[0][1], z_safe], false);
+        { let c = cur; push_move(&mut moves, &mut cur, [c[0], c[1], z_safe], false, out.len()); }
+        push_move(&mut moves, &mut cur, [pts[0][0], pts[0][1], z_safe], false, out.len());
 
         out.push(format!(
             "{} X{} Y{}{}",
@@ -186,7 +186,7 @@ pub fn generate(project: &Project) -> GcodeResult {
                 num(job.dispense_feed, 0)
             ));
         }
-        push_move(&mut moves, &mut cur, [pts[0][0], pts[0][1], z_work], false);
+        push_move(&mut moves, &mut cur, [pts[0][0], pts[0][1], z_work], false, out.len().saturating_sub(1));
         out.push(ee.on_line());
         if job.on_delay_ms > 0 {
             out.push(dwell(st, job.on_delay_ms));
@@ -216,7 +216,7 @@ pub fn generate(project: &Project) -> GcodeResult {
                     f
                 ));
                 for q in &pts[a.start + 1..=a.end] {
-                    push_move(&mut moves, &mut cur, [q[0], q[1], z_work], true);
+                    push_move(&mut moves, &mut cur, [q[0], q[1], z_work], true, out.len().saturating_sub(1));
                 }
                 k = a.end + 1;
             } else {
@@ -228,7 +228,7 @@ pub fn generate(project: &Project) -> GcodeResult {
                     num(p[1], d),
                     f
                 ));
-                push_move(&mut moves, &mut cur, [p[0], p[1], z_work], true);
+                push_move(&mut moves, &mut cur, [p[0], p[1], z_work], true, out.len().saturating_sub(1));
                 k += 1;
             }
         }
@@ -238,7 +238,7 @@ pub fn generate(project: &Project) -> GcodeResult {
         }
         if job.use_z {
             out.push(format!("{} Z{}{}", st.rapid_cmd, num(job.safe_z, d), rapid_f));
-            { let c = cur; push_move(&mut moves, &mut cur, [c[0], c[1], z_safe], false); }
+            { let c = cur; push_move(&mut moves, &mut cur, [c[0], c[1], z_safe], false, out.len()); }
         }
     }
 
@@ -264,9 +264,9 @@ mod tests {
         let mut machine = Machine::new("Test");
         machine.bed_x = 125.0;
         machine.bed_y = 250.0;
-        machine.travel_x = 125.0;
-        machine.travel_y = 250.0;
-        machine.travel_z = 20.0;
+        machine.travel_max[0] = 125.0;
+        machine.travel_max[1] = 250.0;
+        machine.travel_max[2] = 20.0;
         let mut p = Project::new(machine);
         p.parts.push(Part {
             name: "sq".into(),
@@ -428,9 +428,9 @@ mod workable_tests {
         m.bed_x = 110.0;
         m.bed_y = 110.0;
         m.bed_z = 5.0;
-        m.travel_x = 80.0;
-        m.travel_y = 175.0;
-        m.travel_z = 35.0;
+        m.travel_max[0] = 80.0;
+        m.travel_max[1] = 175.0;
+        m.travel_max[2] = 35.0;
         m.axes = [AxisOwner::Bed, AxisOwner::Bed, AxisOwner::EndEffector];
         m.effector_pos = [95.0, 175.0, -1.0];
         m
@@ -490,12 +490,12 @@ mod workable_tests {
     fn tool_axis_workable_follows_bed_position() {
         let mut m = Machine::new("t");
         m.bed_x = 100.0;
-        m.travel_x = 150.0;
+        m.travel_max[0] = 150.0;
         m.axes[0] = AxisOwner::EndEffector;
         m.bed_pos[0] = 20.0;
         // Tool 0..150, bed at 20: the whole bed is reachable.
         assert_eq!(m.workable_on_bed()[0], (0.0, 100.0));
-        m.travel_x = 60.0;
+        m.travel_max[0] = 60.0;
         m.bed_pos[0] = 20.0;
         // Tool 0..60 reaches bed points -20 .. 40, so 0 .. 40.
         assert_eq!(m.workable_on_bed()[0], (0.0, 40.0));
@@ -512,7 +512,7 @@ mod home_tests {
     #[test]
     fn home_defaults_and_first_move_starts_at_home() {
         let mut m = Machine::new("t");
-        m.travel_z = 35.0;
+        m.travel_max[2] = 35.0;
         assert_eq!(m.home_position(), [0.0, 0.0, 35.0]);
         m.home = [Some(5.0), None, Some(20.0)];
         assert_eq!(m.home_position(), [5.0, 0.0, 20.0]);

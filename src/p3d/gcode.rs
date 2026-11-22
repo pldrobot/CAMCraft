@@ -39,9 +39,9 @@ pub fn generate(p: &Project3) -> Result3 {
     let mut moves: Vec<Move> = vec![];
     let home = m.home_position();
     let mut cur = [home[0], home[1], home[2]];
-    let go = |moves: &mut Vec<Move>, cur: &mut [f64; 3], to: [f64; 3], work: bool| {
+    let go = |moves: &mut Vec<Move>, cur: &mut [f64; 3], to: [f64; 3], work: bool, line: usize| {
         if (0..3).any(|i| (cur[i] - to[i]).abs() > 1e-9) {
-            moves.push(Move { from: *cur, to, work });
+            moves.push(Move { from: *cur, to, work, line });
         }
         *cur = to;
     };
@@ -87,7 +87,7 @@ pub fn generate(p: &Project3) -> Result3 {
                 out.push(ee.off_line());
                 // Straight there: there is no safe Z to lift to.
                 out.push(format!("{} X{} Y{} Z{}{}", st.rapid_cmd, num(x, d), num(y, d), num(z, d), rapid_f));
-                go(&mut moves, &mut cur, [x, y, z], false);
+                go(&mut moves, &mut cur, [x, y, z], false, out.len().saturating_sub(1));
             }
             Kind3::Path => {
                 let pts = p.step_points(step);
@@ -126,13 +126,13 @@ pub fn generate(p: &Project3) -> Result3 {
                     }
                     for q in lead.iter().skip(1) {
                         out.push(format!("{} X{} Y{} Z{} F{}", st.linear_cmd, num(q[0], d), num(q[1], d), num(q[2], d), num(feed, 0)));
-                        go(&mut moves, &mut cur, *q, false);
+                        go(&mut moves, &mut cur, *q, false, out.len().saturating_sub(1));
                     }
                 } else {
                     // No lead in and no safe Z: straight to the start.
                     warnings.push(format!("Step {} moves straight to its start, with no lead in to follow.", i + 1));
                     out.push(format!("{} X{} Y{} Z{}{}", st.rapid_cmd, num(first[0], d), num(first[1], d), num(first[2], d), rapid_f));
-                    go(&mut moves, &mut cur, first, false);
+                    go(&mut moves, &mut cur, first, false, out.len().saturating_sub(1));
                 }
                 out.push(ee.on_line());
                 if job.on_delay_ms > 0 {
@@ -162,7 +162,7 @@ pub fn generate(p: &Project3) -> Result3 {
                     }
                     // The preview follows the original points.
                     for r in &pts[from + 1..=k] {
-                        go(&mut moves, &mut cur, *r, true);
+                        go(&mut moves, &mut cur, *r, true, out.len().saturating_sub(1));
                     }
                     from = k;
                 }

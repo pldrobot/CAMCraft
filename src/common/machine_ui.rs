@@ -148,17 +148,24 @@ pub(crate) fn machine_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool)
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
             ui.strong("Machine construction");
+            let mut edited: Vec<(usize, f64, f64)> = vec![];
             egui::Grid::new("m_build").num_columns(5).striped(true).show(ui, |ui| {
-                for h in ["Axis", "Travel (mm)", "Bed size (mm)", "Moves the", ""] {
+                for h in ["Axis", "Min (mm)", "Max (mm)", "Bed size (mm)", "Moves the"] {
                     ui.strong(h);
                 }
                 ui.end_row();
                 let names = ["X", "Y", "Z"];
-                let travel = [&mut m.travel_x, &mut m.travel_y, &mut m.travel_z];
+                let ranges = [0, 1, 2].map(|i| m.travel_range(i));
                 let bed = [&mut m.bed_x, &mut m.bed_y, &mut m.bed_z];
-                for (i, (t, b)) in travel.into_iter().zip(bed).enumerate() {
+                for (i, b) in bed.into_iter().enumerate() {
                     ui.label(names[i]);
-                    *ch |= ui.add(egui::DragValue::new(t).speed(1.0).range(1.0..=5000.0)).changed();
+                    let (mut lo, mut hi) = ranges[i];
+                    let before = (lo, hi);
+                    ui.add(egui::DragValue::new(&mut lo).speed(1.0).range(-5000.0..=hi - 1.0));
+                    ui.add(egui::DragValue::new(&mut hi).speed(1.0).range(lo + 1.0..=5000.0));
+                    if (lo, hi) != before {
+                        edited.push((i, lo, hi));
+                    }
                     *ch |= ui.add(egui::DragValue::new(b).speed(1.0).range(1.0..=5000.0)).changed();
                     ui.horizontal(|ui| {
                         *ch |= ui.radio_value(&mut m.axes[i], AxisOwner::EndEffector, "End effector").changed();
@@ -168,6 +175,11 @@ pub(crate) fn machine_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool)
                     ui.end_row();
                 }
             });
+            for (i, lo, hi) in edited {
+                m.travel_min[i] = lo;
+                m.travel_max[i] = hi;
+                *ch = true;
+            }
             ui.add_space(8.0);
             ui.strong("Bed & End-Effector Positions");
             let (bp, ep) = (m.bed_position(), m.effector_position());
@@ -355,6 +367,23 @@ pub(crate) fn scripts_section(ui: &mut egui::Ui, m: &mut Machine, ch: &mut bool)
     ui.add_space(8.0);
     ui.separator();
     ui.strong("G-code format");
+    egui::Grid::new("m_fw").num_columns(2).show(ui, |ui| {
+        ui.label("Firmware");
+        let mut fw = m.firmware;
+        egui::ComboBox::from_id_salt("m_fw_sel").selected_text(fw.label()).show_ui(ui, |ui| {
+            for f in crate::common::machine::Firmware::ALL {
+                ui.selectable_value(&mut fw, f, f.label());
+            }
+        });
+        if fw != m.firmware {
+            m.set_firmware(fw);
+            *ch = true;
+        }
+        ui.end_row();
+        ui.label("Baud rate");
+        *ch |= ui.add(egui::DragValue::new(&mut m.baud).range(1200..=2_000_000)).changed();
+        ui.end_row();
+    });
     let g = &mut m.gcode;
     egui::Grid::new("m_fmt").num_columns(2).show(ui, |ui| {
         ui.label("Dwell template");
